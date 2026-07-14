@@ -1,0 +1,258 @@
+"""
+飞书 Webhook 告警模块（display_monitor/notify 第一版）
+=====================================================
+Webhook 从环境变量读取，绝不硬编码：
+
+  # Windows PowerShell
+  $env:FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
+  $env:FEISHU_WEBHOOK_SECRET = "签名密钥"    # 机器人开了"签名校验"才需要
+  # 卡片内嵌截图需要企业自建应用凭证(权限: im:resource 上传图片):
+  $env:FEISHU_APP_ID = "cli_xxx"
+  $env:FEISHU_APP_SECRET = "xxx"
+
+用法:
+  from notify.feishu_notifier import send_text, send_event
+  send_text("测试消息")
+  send_event(event_dict)          # event.json 的内容, 发红色告警卡片
+
+命令行自测:
+  python notify/feishu_notifier.py --test                 # 发一条测试文本
+  python notify/feishu_notifier.py --event <event.json>   # 发送事件卡片
+  python notify/feishu_notifier.py --event <event.json> --dry-run  # 只打印payload不发送
+
+说明:
+- 仅用标准库(urllib), 无第三方依赖。
+- 卡片消息(msg_type=interactive)默认; --text 降级为纯文本。
+- 截图直传飞书需要应用凭证(image_key), 属第二步; 当前证据路径为本地文件。
+"""
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime
+
+ENV_WEBHOOK = "FEISHU_WEBHOOK"
+ENV_SECRET = "FEISHU_WEBHOOK_SECRET"
+TIMEOUT_S = 10
+RETRIES = 2
+
+
+class FeishuError(RuntimeError):
+    pass
+
+
+def _webhook():
+    url = os.environ.get(ENV_WEBHOOK, "").strip()
+    if not url:
+        raise FeishuError(
+            f"环境变量 {ENV_WEBHOOK} 未设置。PowerShell: $env:{ENV_WEBHOOK}=\"<webhook url>\"")
+    return url
+
+
+def _sign_fields():
+    """机器人开启签名校验时, 附加 timestamp + sign 字段。"""
+    secret = os.environ.get(ENV_SECRET, "").strip()
+    if not secret:
+        return {}
+    ts = str(int(time.time()))
+    string_to_sign = f"{ts}\n{secret}"
+    digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
+    return {"timestamp": ts, "sign": base64.b64encode(digest).decode("utf-8")}
+
+
+def _post(payload, dry_run=False):
+    payload = {**_sign_fields(), **payload}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if dry_run:
+        print("[dry-run] payload:")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return {"code": 0, "dry_run": True}
+    url = _webhook()
+    last_err = None
+    for attempt in range(1 + RETRIES):
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            # 自定义机器人成功: {"code":0,...} 或旧版 {"StatusCode":0}
+            if data.get("code", data.get("StatusCode", -1)) == 0:
+                return data
+            raise FeishuError(f"飞书返回错误: {data}")
+        except (urllib.error.URLError, TimeoutError, FeishuError) as e:
+            last_err = e
+            if attempt < RETRIES:
+                time.sleep(1.5 * (attempt + 1))
+    raise FeishuError(f"发送失败(已重试{RETRIES}次): {last_err}")
+
+
+ENV_APP_ID = "FEISHU_APP_ID"
+ENV_APP_SECRET = "FEISHU_APP_SECRET"
+
+
+def _read_json(req, timeout):
+    """urlopen 并解析 JSON；HTTP 4xx/5xx 时读取响应体给出飞书具体错误。"""
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8")
+        except Exception:
+            detail = ""
+        raise FeishuError(f"HTTP {e.code}: {detail[:300]}") from None
+
+
+def _tenant_token():
+    """用企业自建应用凭证换 tenant_access_token；未配置返回 None。"""
+    app_id = os.environ.get(ENV_APP_ID, "").strip()
+    app_secret = os.environ.get(ENV_APP_SECRET, "").strip()
+    if not app_id or not app_secret:
+        return None
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        data=body, headers={"Content-Type": "application/json"})
+    data = _read_json(req, TIMEOUT_S)
+    if data.get("code") != 0:
+        raise FeishuError(f"获取 tenant_access_token 失败: {data}")
+    return data["tenant_access_token"]
+
+
+def upload_image(image_path):
+    """上传图片到飞书, 返回 image_key。需要 FEISHU_APP_ID/FEISHU_APP_SECRET。"""
+    token = _tenant_token()
+    if token is None:
+        raise FeishuError(f"未配置 {ENV_APP_ID}/{ENV_APP_SECRET}, 无法上传图片")
+    boundary = "----feishu_notifier_boundary"
+    with open(image_path, "rb") as f:
+        img = f.read()
+    parts = []
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                 f"name=\"image_type\"\r\n\r\nmessage\r\n".encode())
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
+                 f"name=\"image\"; filename=\"evidence.jpg\"\r\n"
+                 f"Content-Type: image/jpeg\r\n\r\n".encode())
+    parts.append(img)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/im/v1/images", data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "Authorization": f"Bearer {token}"})
+    data = _read_json(req, TIMEOUT_S * 2)
+    if data.get("code") != 0:
+        raise FeishuError(f"上传图片失败: {data}")
+    return data["data"]["image_key"]
+
+
+def _fmt_ts(ms):
+    if ms is None:
+        return "-"
+    ms = int(ms)
+    return f"{ms//3600000:02d}:{ms%3600000//60000:02d}:{ms%60000//1000:02d}.{ms%1000:03d}"
+
+
+def send_text(text, dry_run=False):
+    """发送纯文本消息。"""
+    return _post({"msg_type": "text", "content": {"text": text}}, dry_run=dry_run)
+
+
+def event_to_text(event):
+    """事件 -> 文本消息（卡片被禁用时的降级格式）。"""
+    return (
+        "🚨 Display Black Screen Detected\n"
+        f"事件：{event.get('event_type', 'black_screen').upper()} ({event.get('event_id', '-')})\n"
+        f"来源：{event.get('source', '-')}\n"
+        f"视频位置：{_fmt_ts(event.get('source_timestamp_ms'))}\n"
+        f"检测时间：{event.get('capture_time', '-')}\n"
+        f"帧序号：{event.get('frame_index', '-')}\n"
+        f"置信分数：{event.get('score', '-')}\n"
+        f"证据路径：{event.get('screenshot', '-')}"
+    )
+
+
+def event_to_card(event, image_key=None):
+    """事件 -> 飞书消息卡片(红色告警头), image_key 非空时内嵌截图。"""
+    bbox = event.get("bbox")
+    fields = [
+        ("事件", f"{event.get('event_type', 'black_screen').upper()}  `{event.get('event_id', '-')}`"),
+        ("来源", str(event.get("source", "-"))),
+        ("视频位置", _fmt_ts(event.get("source_timestamp_ms"))),
+        ("检测时间", str(event.get("capture_time", "-"))),
+        ("帧序号", str(event.get("frame_index", "-"))),
+        ("置信分数", str(event.get("score", "-"))),
+        ("检出区域", str(bbox) if bbox else "-"),
+        ("证据路径", str(event.get("screenshot", "-"))),
+    ]
+    md = "\n".join(f"**{k}：**{v}" for k, v in fields)
+    elements = [{"tag": "markdown", "content": md}]
+    if image_key:
+        elements.append({"tag": "img", "img_key": image_key,
+                         "alt": {"tag": "plain_text", "content": "黑屏证据拼图"}})
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "red",
+                "title": {"tag": "plain_text", "content": "🚨 Display Black Screen Detected"},
+            },
+            "elements": elements + [
+                {"tag": "note", "elements": [{
+                    "tag": "plain_text",
+                    "content": f"display_monitor · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}]},
+            ],
+        },
+    }
+
+
+def send_event(event, card=True, dry_run=False, image_path=None):
+    """发送黑屏事件告警。event 为 event.json 的 dict。
+    image_path 非空且配置了应用凭证时, 截图内嵌进卡片; 否则降级为纯文字卡片。"""
+    image_key = None
+    if card and image_path and not dry_run:
+        try:
+            image_key = upload_image(image_path)
+        except Exception as e:
+            print(f"  ⚠️ 截图上传失败(卡片将不带图): {e}")
+    if card:
+        return _post(event_to_card(event, image_key=image_key), dry_run=dry_run)
+    return send_text(event_to_text(event), dry_run=dry_run)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="飞书 Webhook 告警自测")
+    parser.add_argument("--test", action="store_true", help="发送一条测试文本")
+    parser.add_argument("--event", help="发送指定 event.json")
+    parser.add_argument("--text", action="store_true", help="用纯文本代替卡片")
+    parser.add_argument("--dry-run", action="store_true", help="只打印 payload 不发送")
+    parser.add_argument("--upload-test", help="单独测试图片上传, 参数为图片路径")
+    args = parser.parse_args()
+
+    if args.upload_test:
+        print("image_key:", upload_image(args.upload_test))
+        return
+
+    if args.test:
+        r = send_text(f"✅ feishu_notifier 测试消息 {datetime.now():%Y-%m-%d %H:%M:%S}",
+                      dry_run=args.dry_run)
+        print("发送结果:", r)
+    elif args.event:
+        with open(args.event, encoding="utf-8") as f:
+            event = json.load(f)
+        r = send_event(event, card=not args.text, dry_run=args.dry_run,
+                       image_path=event.get("screenshot"))
+        print("发送结果:", r)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

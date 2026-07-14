@@ -1,0 +1,2 @@
+This folder contians algorithm for analyzing screen abnormal: black screen, white screen, screen flickersing, screen distortion, screen freezing from video or camera input.
+The documentaion generated from this project should be saved to C:\Users\XGTech_ZHU\iCloudDrive\iCloud~md~obsidian\AI赋能 in .md format
