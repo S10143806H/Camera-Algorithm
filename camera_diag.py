@@ -25,9 +25,10 @@ USB2.0 摄像头诊断 + 黑屏检测预览工具
 
 预览快捷键:
   Q 退出        SPACE 暂停/继续      . 单帧步进(视频)   , 单帧步退(视频)
-  D 检测开/关   R 逐块框选多屏ROI    C 自动标定多屏ROI  X 清除ROI
+  D 检测开/关   R 进入框选模式(非阻塞)  C 自动标定多屏ROI  X 清除ROI
   S 保存当前帧截图(diag_captures/)
-  R 用法: 拖框选中第一块屏 → ENTER 确认 → 继续拖框下一块 → 全部选完按 ESC
+  R 用法: 鼠标拖框添加一块 → 继续拖下一块 → ENTER 应用 / BACKSPACE 撤销 / ESC 取消
+          框选期间预览不卡住，画面持续刷新，其它快捷键在退出框选后恢复
 
 黑屏检测重要相机参数（按影响排序）:
   1. AutoExposure=0(手动) —— 屏幕变黑时自动曝光会拉亮整个画面，
@@ -261,6 +262,32 @@ def preview_loop(cap, info, args):
     if not is_video:
         setup_trackbars(win, cap)
 
+    # 手动框选：自己在主循环里做，不用 cv2.selectROIs。
+    # selectROIs 是阻塞调用，进去后主循环停摆、其它快捷键全失效，
+    # 且它把 c 键定义为"取消当前框"，会吃掉 C（自动标定），造成"按 C 没反应"。
+    sel = {"on": False, "drag": False, "p0": None, "p1": None, "boxes": []}
+
+    def on_mouse(event, x, y, flags, _param):
+        if not sel["on"]:
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            sel["drag"] = True
+            sel["p0"] = sel["p1"] = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and sel["drag"]:
+            sel["p1"] = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP and sel["drag"]:
+            sel["drag"] = False
+            sel["p1"] = (x, y)
+            (x0, y0), (x1, y1) = sel["p0"], sel["p1"]
+            box = (min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+            if box[2] > 10 and box[3] > 10 and len(sel["boxes"]) < max_screens:
+                sel["boxes"].append(box)
+                print(f"  ➕ 已框选第 {len(sel['boxes'])}/{max_screens} 块: {box}"
+                      f"   (ENTER 应用 / BACKSPACE 撤销 / ESC 取消)")
+            sel["p0"] = sel["p1"] = None
+
+    cv2.setMouseCallback(win, on_mouse)
+
     calib_buf = deque(maxlen=40)      # 相机模式滚动标定缓存
     last_calib_sample = 0.0
     save_dir = Path(__file__).resolve().parent / "diag_captures"
@@ -368,6 +395,19 @@ def preview_loop(cap, info, args):
             display = frame.copy()
             draw_screen_boxes(display, screen_rois)
 
+        # ---- 框选模式叠加层 ----
+        if sel["on"]:
+            for i, (bx, by, bw, bh) in enumerate(sel["boxes"], 1):
+                cv2.rectangle(display, (bx, by), (bx + bw, by + bh), (0, 255, 255), 2)
+                cv2.putText(display, f"S{i}", (bx + 5, by + 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+            if sel["drag"] and sel["p0"] and sel["p1"]:
+                cv2.rectangle(display, sel["p0"], sel["p1"], (0, 255, 255), 2)
+            _put_text_clamped(display,
+                              f"SELECT MODE {len(sel['boxes'])}/{max_screens}  "
+                              f"drag=add  ENTER=apply  BACKSPACE=undo  ESC=cancel",
+                              12, 68, 0.62, (0, 255, 255))
+
         # ---- 状态栏 ----
         gray_mean = frame.mean()
         if is_video:
@@ -388,6 +428,28 @@ def preview_loop(cap, info, args):
 
         # ---- 按键 ----
         key = cv2.waitKey(1 if not paused else 30) & 0xFF
+
+        # 框选模式独占按键：此时 ESC 是"取消框选"而非退出程序
+        if sel["on"]:
+            if key == 13:                       # ENTER 应用
+                if sel["boxes"]:
+                    screen_rois = order_rois(sel["boxes"])[:max_screens]
+                    screen_state.clear(); results = []
+                    for i, r in enumerate(screen_rois, 1):
+                        print(f"     S{i}: {r}")
+                    print(f"  可写入 --roi {format_rois(screen_rois)}")
+                else:
+                    print("  未框选任何区域，ROI 保持不变")
+                sel.update(on=False, drag=False, boxes=[], p0=None, p1=None)
+            elif key == 27:                     # ESC 取消
+                sel.update(on=False, drag=False, boxes=[], p0=None, p1=None)
+                print("  已退出框选模式，ROI 保持不变")
+            elif key == 8:                      # BACKSPACE 撤销
+                if sel["boxes"]:
+                    print(f"  ➖ 撤销第 {len(sel['boxes'])} 块")
+                    sel["boxes"].pop()
+            continue
+
         if key in (ord('q'), ord('Q'), 27):
             break
         elif key == ord(' '):
@@ -401,21 +463,10 @@ def preview_loop(cap, info, args):
                 detect_on = not detect_on
                 print(f"  检测 -> {'开' if detect_on else '关'}")
         elif key in (ord('r'), ord('R')):
-            # 多屏框选：逐块拖框后回车确认下一块，ESC 结束
-            print(f"  🖥️ 框选每块屏幕：拖框 → ENTER/SPACE 确认这一块 → 继续拖下一块 "
-                  f"→ 全部选完按 ESC   (最多 {max_screens} 块, c 键取消当前框)")
-            # printNotice=False：关掉 OpenCV 自带的英文提示，否则每选一块就重复刷屏
-            sels = cv2.selectROIs(win, frame, showCrosshair=True,
-                                  fromCenter=False, printNotice=False)
-            picked = [tuple(int(v) for v in s) for s in sels if s[2] > 10 and s[3] > 10]
-            if picked:
-                screen_rois = order_rois(picked)[:max_screens]
-                screen_state.clear(); results = []
-                for i, r in enumerate(screen_rois, 1):
-                    print(f"     S{i}: {r}")
-                print(f"  可写入 --roi {format_rois(screen_rois)}")
-            else:
-                print("  未选中任何区域，ROI 保持不变")
+            sel.update(on=True, drag=False, boxes=[], p0=None, p1=None)
+            print(f"  🖥️ 进入框选模式（最多 {max_screens} 块）：鼠标拖框添加一块 → "
+                  f"继续拖下一块 → ENTER 应用 / BACKSPACE 撤销 / ESC 取消。"
+                  f"预览不会卡住，画面持续刷新。")
         elif key in (ord('c'), ord('C')):
             if is_video and HAVE_DETECTOR:
                 screen_rois = calibrate_screen_rois(args.video, max_screens=max_screens)
