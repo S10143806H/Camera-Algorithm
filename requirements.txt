@@ -1,0 +1,11 @@
+# 屏幕异常检测算法依赖
+# 安装: pip install -r requirements.txt
+#
+# 无 GUI 的服务器/容器请改用 opencv-python-headless（去掉 opencv-python 一行）：
+#   pip install opencv-python-headless numpy pillow
+# 注意 headless 版不提供 imshow/createTrackbar，camera_diag.py 预览模式不可用，
+# 但 --batch 批量检测与全部 analyze_screen_*.py 正常工作。
+
+opencv-python>=4.8
+numpy>=1.24,<2
+pillow>=10.0

@@ -3,10 +3,16 @@
 =====================================================
 Webhook 从环境变量读取，绝不硬编码：
 
+  # Linux / macOS (bash|zsh) —— 可直接 source set_feishu_env.sh
+  export FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
+  export FEISHU_WEBHOOK_SECRET="签名密钥"    # 机器人开了"签名校验"才需要
+  # 卡片内嵌截图需要企业自建应用凭证(权限: im:resource 上传图片):
+  export FEISHU_APP_ID="cli_xxx"
+  export FEISHU_APP_SECRET="xxx"
+
   # Windows PowerShell
   $env:FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
-  $env:FEISHU_WEBHOOK_SECRET = "签名密钥"    # 机器人开了"签名校验"才需要
-  # 卡片内嵌截图需要企业自建应用凭证(权限: im:resource 上传图片):
+  $env:FEISHU_WEBHOOK_SECRET = "签名密钥"
   $env:FEISHU_APP_ID = "cli_xxx"
   $env:FEISHU_APP_SECRET = "xxx"
 
@@ -16,9 +22,9 @@ Webhook 从环境变量读取，绝不硬编码：
   send_event(event_dict)          # event.json 的内容, 发红色告警卡片
 
 命令行自测:
-  python notify/feishu_notifier.py --test                 # 发一条测试文本
-  python notify/feishu_notifier.py --event <event.json>   # 发送事件卡片
-  python notify/feishu_notifier.py --event <event.json> --dry-run  # 只打印payload不发送
+  python3 notify/feishu_notifier.py --test                 # 发一条测试文本
+  python3 notify/feishu_notifier.py --event <event.json>   # 发送事件卡片
+  python3 notify/feishu_notifier.py --event <event.json> --dry-run  # 只打印payload不发送
 
 说明:
 - 仅用标准库(urllib), 无第三方依赖。
@@ -51,7 +57,9 @@ def _webhook():
     url = os.environ.get(ENV_WEBHOOK, "").strip()
     if not url:
         raise FeishuError(
-            f"环境变量 {ENV_WEBHOOK} 未设置。PowerShell: $env:{ENV_WEBHOOK}=\"<webhook url>\"")
+            f"环境变量 {ENV_WEBHOOK} 未设置。\n"
+            f"  bash/zsh:   export {ENV_WEBHOOK}=\"<webhook url>\"  (或 source set_feishu_env.sh)\n"
+            f"  PowerShell: $env:{ENV_WEBHOOK}=\"<webhook url>\"")
     return url
 
 

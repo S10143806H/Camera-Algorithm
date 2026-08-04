@@ -1,5 +1,8 @@
 set_feishu_env.ps1
+set_feishu_env.sh
 diag_captures/
+.venv/
+venv/
 __pycache__/
 *.py[cod]
 data_source/

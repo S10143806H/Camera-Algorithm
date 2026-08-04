@@ -1,34 +1,28 @@
 """
 USB2.0 摄像头诊断工具 —— 修复黑屏问题
-核心修复：强制 MJPG 四字节码 + 按设备符号链接打开,专门用来解决“摄像头打开了却是黑屏”的问题
-需要安装 pywin32 库：pip install pywin32
-python camera_diag.py 或者 python3 camera_diag.py
+核心修复：强制 MJPG 四字节码 + 遍历 backend/fourcc/分辨率，专门用来解决“摄像头打开了却是黑屏”的问题
+跨平台：Windows(MSMF/DSHOW) / Linux(V4L2) / macOS(AVFoundation)，无需 pywin32。
+依赖：pip install -r ../requirements.txt
+运行：python3 camera_diag.py
 """
 
-import cv2
+import sys
 import time
-import subprocess
-import re
-import threading
+from pathlib import Path
+
+import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from platform_compat import (
+    capture_backends,
+    list_cameras,
+    load_cjk_font,
+    privacy_hint,
+)
 
-def load_chinese_font(size=24):
-    """加载 Windows 中文字体。"""
-    font_paths = [
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-    ]
-    for font_path in font_paths:
-        try:
-            return ImageFont.truetype(font_path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
-CHINESE_FONT = load_chinese_font()
+CHINESE_FONT = load_cjk_font()
 
 
 def put_chinese_text(frame, text, position=(10, 5)):
@@ -47,46 +41,8 @@ def put_chinese_text(frame, text, position=(10, 5)):
 
 
 def get_camera_symlinks():
-    """
-    列出系统摄像头设备
-    通过 PowerShell 获取每个摄像设备的符号链接 (SymbolicLink)，
-    MSMF 后端可用此路径直接打开指定设备。
-    """
-    ps = r"""
-$devs = Get-PnpDevice -Class Camera -Status OK
-foreach ($d in $devs) {
-    $name = $d.FriendlyName
-    $iid  = $d.InstanceId
-    # 通过注册表找 MF 设备符号链接
-    $props = Get-PnpDeviceProperty -InstanceId $iid -KeyName 'DEVPKEY_Device_SymbolicLink' -ErrorAction SilentlyContinue
-    $sym = if ($props) { $props.Data } else { "" }
-    # 也尝试从设备接口获取
-    if (-not $sym) {
-        $ifaces = Get-PnpDeviceInterface -InstanceId $iid -ErrorAction SilentlyContinue
-        $sym = ($ifaces | Select-Object -First 1).SymbolicLink
-    }
-    "$name||$iid||$sym"
-}
-"""
-    try:
-        out = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", ps],
-            text=True, timeout=20,
-        )
-    except Exception as e:
-        print(f"  ❌ PowerShell 查询失败: {e}")
-        return []
-
-    devices = []
-    for line in out.strip().splitlines():
-        line = line.strip()
-        if "||" in line:
-            parts = line.split("||")
-            name = parts[0].strip()
-            iid = parts[1].strip() if len(parts) > 1 else ""
-            sym = parts[2].strip() if len(parts) > 2 else ""
-            devices.append({"name": name, "instance_id": iid, "symlink": sym})
-    return devices
+    """列出系统摄像头设备（Windows: PowerShell / Linux: /dev/video* / macOS: 探测）。"""
+    return list_cameras()
 
 
 def try_open_camera(idx, backend, fourcc=None, width=None, height=None):
@@ -152,10 +108,7 @@ def diagnose_all():
         print(f"     Sym: {d['symlink'][:80]}")
 
     # 测试矩阵
-    backends = [
-        (cv2.CAP_MSMF, "MSMF"),
-        (cv2.CAP_DSHOW, "DSHOW"),
-    ]
+    backends = capture_backends()
     fourccs = [
         ("MJPG", "MJPG"),
         ("YUY2", "YUY2"),
@@ -303,11 +256,7 @@ def main():
         cap, info = result
         show_preview(cap, info)
     else:
-        print("\n  ❌ 所有组合均黑屏！可能原因：")
-        print("     1. 摄像头隐私开关未打开（物理或 Windows 隐私设置）")
-        print("     2. 摄像头被其他程序占用")
-        print("     3. 驱动问题，需更新固件")
-        print(f"\n  💡 请确认: Windows 设置 → 隐私 → 相机 → 允许应用访问相机 = 开")
+        privacy_hint()
 
 
 if __name__ == "__main__":

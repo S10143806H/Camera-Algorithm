@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# 飞书告警环境变量模板（Linux / macOS）
+# 用法:
+#   cp set_feishu_env.sh.example set_feishu_env.sh
+#   # 填入真实值后
+#   source set_feishu_env.sh
+#
+# set_feishu_env.sh 已在 .gitignore 中，切勿提交真实凭证。
+
+export FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx"
+
+# 机器人开启“签名校验”时必填，否则留空
+export FEISHU_WEBHOOK_SECRET=""
+
+# 卡片内嵌截图需要企业自建应用凭证（权限: im:resource 上传图片），不用可留空
+export FEISHU_APP_ID=""
+export FEISHU_APP_SECRET=""
+
+echo "FEISHU_WEBHOOK set: ${FEISHU_WEBHOOK:0:48}..."

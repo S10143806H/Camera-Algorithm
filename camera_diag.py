@@ -6,13 +6,16 @@ USB2.0 摄像头诊断 + 黑屏检测预览工具
 3. 黑屏检测：--detect 开启，复用 analyze_black_screens.detect_dark_region，
    在预览中用红色高亮框圈出检测到的黑屏区域，橙框为标定的屏幕 ROI。
 
+跨平台: Linux(V4L2) / Windows(MSMF,DSHOW) / macOS(AVFoundation)，
+后端选择与设备枚举见 platform_compat.py；环境准备见 README.md。
+
 用法:
-  python camera_diag.py                              # 诊断 + 纯预览
-  python camera_diag.py --detect                     # 摄像头预览 + 黑屏检测
-  python camera_diag.py --video ticket.mp4 --detect  # 手动播放问题单视频 + 检测
-  python camera_diag.py --device 0 --detect          # 跳过诊断直接开指定相机
-  python camera_diag.py --detect --roi 64,0,896,516  # 固定屏幕 ROI（推荐台架用）
-  python camera_diag.py --batch data_source --step 3   # 批量自动检测目录内全部视频
+  python3 camera_diag.py                              # 诊断 + 纯预览
+  python3 camera_diag.py --detect                     # 摄像头预览 + 黑屏检测
+  python3 camera_diag.py --video ticket.mp4 --detect  # 手动播放问题单视频 + 检测
+  python3 camera_diag.py --device 0 --detect          # 跳过诊断直接开指定相机
+  python3 camera_diag.py --detect --roi 64,0,896,516  # 固定屏幕 ROI（推荐台架用）
+  python3 camera_diag.py --batch data_source --step 3   # 批量自动检测目录内全部视频
 
 预览快捷键:
   Q 退出        SPACE 暂停/继续      . 单帧步进(视频)   , 单帧步退(视频)
@@ -30,7 +33,6 @@ USB2.0 摄像头诊断 + 黑屏检测预览工具
 """
 
 import argparse
-import subprocess
 import sys
 import threading
 import time
@@ -42,6 +44,14 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from platform_compat import (
+    capture_backends,
+    list_cameras,
+    privacy_hint,
+    set_auto_exposure,
+)
+
 try:
     from analyze_black_screens import (
         detect_dark_region,
@@ -109,9 +119,8 @@ def setup_trackbars(win, cap):
         cv2.createTrackbar(name, win, init, vmax, make_cb(prop, conv, name))
 
     def auto_exp_cb(v):
-        # DSHOW: 0.75=自动 0.25=手动;  MSMF: 1=自动 0=手动
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if v else 0.25)
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1 if v else 0)
+        # 取值随后端而异（DSHOW/MSMF/V4L2），交由 platform_compat 分派
+        set_auto_exposure(cap, bool(v))
         print(f"  AutoExposure -> {'自动' if v else '手动(建议)'}")
 
     cv2.createTrackbar("AutoExp 0/1", win, 1, 1, auto_exp_cb)
@@ -119,40 +128,13 @@ def setup_trackbars(win, cap):
 
 # ---------------------------------------------------------------- 设备枚举
 def get_camera_symlinks():
-    """列出系统摄像头设备（PowerShell）。"""
-    ps = r"""
-$devs = Get-PnpDevice -Class Camera -Status OK
-foreach ($d in $devs) {
-    $name = $d.FriendlyName
-    $iid  = $d.InstanceId
-    $props = Get-PnpDeviceProperty -InstanceId $iid -KeyName 'DEVPKEY_Device_SymbolicLink' -ErrorAction SilentlyContinue
-    $sym = if ($props) { $props.Data } else { "" }
-    if (-not $sym) {
-        $ifaces = Get-PnpDeviceInterface -InstanceId $iid -ErrorAction SilentlyContinue
-        $sym = ($ifaces | Select-Object -First 1).SymbolicLink
-    }
-    "$name||$iid||$sym"
-}
-"""
-    try:
-        out = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", ps], text=True, timeout=20)
-    except Exception as e:
-        print(f"  ❌ PowerShell 查询失败: {e}")
-        return []
-    devices = []
-    for line in out.strip().splitlines():
-        if "||" in line:
-            parts = line.strip().split("||")
-            devices.append({"name": parts[0].strip(),
-                            "instance_id": parts[1].strip() if len(parts) > 1 else "",
-                            "symlink": parts[2].strip() if len(parts) > 2 else ""})
-    return devices
+    """列出系统摄像头设备（Windows: PowerShell / Linux: /dev/video* / macOS: 探测）。"""
+    return list_cameras()
 
 
 def open_device(idx):
     """跳过完整诊断，按常用组合快速打开指定相机。"""
-    for be_code, be_name in [(cv2.CAP_MSMF, "MSMF"), (cv2.CAP_DSHOW, "DSHOW")]:
+    for be_code, be_name in capture_backends():
         cap = cv2.VideoCapture(idx, be_code)
         if not cap.isOpened():
             cap.release()
@@ -181,7 +163,7 @@ def diagnose_all():
     for d in devices:
         print(f"  📷 {d['name']}\n     ID:  {d['instance_id']}\n     Sym: {d['symlink'][:80]}")
 
-    backends = [(cv2.CAP_MSMF, "MSMF"), (cv2.CAP_DSHOW, "DSHOW")]
+    backends = capture_backends()
     fourccs = [("MJPG", "MJPG"), ("YUY2", "YUY2"), (None, "默认")]
     resolutions = [(None, None), (640, 480), (1280, 720), (1920, 1080)]
 
@@ -679,11 +661,7 @@ def main():
               f"{info.get('fourcc','')} {info.get('w')}x{info.get('h')} mean={info['mean']:.1f}")
         preview_loop(cap, info, args)
     else:
-        print("\n  ❌ 所有组合均黑屏！可能原因：")
-        print("     1. 摄像头隐私开关未打开（物理或 Windows 隐私设置）")
-        print("     2. 摄像头被其他程序占用")
-        print("     3. 驱动问题，需更新固件")
-        print("  💡 Windows 设置 → 隐私 → 相机 → 允许应用访问相机 = 开")
+        privacy_hint()
 
 
 if __name__ == "__main__":

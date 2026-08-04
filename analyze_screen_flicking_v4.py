@@ -1,12 +1,11 @@
 """闪屏检测 v4 引擎包装（黄色检测框）。
 
-复用 D:\\flicker-detection 的 FlickerDetectorV4（增益归一化局部能量 +
-结构不变性门控 + ABA 脉冲 + 滚动 MAD 基线），比本目录 V 型分区检测器
-召回更强（实测命中 60fps 背光闪和低幅仪表闪）。
-flicker_detector.py / flicker_detector_v4.py 为副本，源仓库 D:\\flicker-detection。
+复用 FlickerDetectorV4（增益归一化局部能量 + 结构不变性门控 + ABA 脉冲 +
+滚动 MAD 基线），比本目录 V 型分区检测器召回更强（实测命中 60fps 背光闪和
+低幅仪表闪）。flicker_detector.py / flicker_detector_v4.py 为上游引擎副本。
 
 用法同其他 analyze_screen_*：
-  python analyze_screen_flicking_v4.py --video x.mp4 [--out dir] [--finalize]
+  python3 analyze_screen_flicking_v4.py --video x.mp4 [--out dir] [--finalize]
 """
 import sys
 from pathlib import Path

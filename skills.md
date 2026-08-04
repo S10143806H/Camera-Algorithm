@@ -41,8 +41,8 @@ flowchart TD
 | sheet_url | 飞书表格链接 | 用于回写问题数量、附件路径、检测结果 |
 | sheet_id | 目标工作表 ID | 示例：黑屏问题表 |
 | keyword | 黑屏 / 花屏 / 闪屏 / 冻屏 / 白屏 | 缺陷名称筛选条件 |
-| data_root | `C:\Users\XGTech_ZHU\Pictures\black-screen\data_source` | 本地样本保存目录 |
-| output_dir | `data_root\detected_results` | 红框结果、JSON、CSV 输出目录 |
+| data_root | `<repo>/data_source`（可用 `CAMERA_ALGO_DATA_ROOT` 覆盖） | 本地样本保存目录 |
+| output_dir | `<data_root>/detected_results` | 红框结果、JSON、CSV 输出目录 |
 | review_columns | L:W | 自动化结果回写列 |
 
 ## 推荐流程
@@ -67,10 +67,14 @@ flowchart TD
 
 4. 运行检测算法。
 
+```bash
+# Linux / macOS
+python3 analyze_black_screens.py --root ./data_source --recursive
+```
+
 ```powershell
-python "C:\Users\XGTech_ZHU\Pictures\black-screen\analyze_black_screens.py" `
-  --root "C:\Users\XGTech_ZHU\Pictures\black-screen\data_source" `
-  --recursive
+# Windows PowerShell
+python analyze_black_screens.py --root .\data_source --recursive
 ```
 
 5. 回写检测结果。

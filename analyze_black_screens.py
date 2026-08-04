@@ -1,6 +1,7 @@
 import csv
 import argparse
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -9,7 +10,8 @@ import cv2
 import numpy as np
 
 
-ROOT = Path(r"C:\Users\XGTech_ZHU\Pictures\black-screen")
+ROOT = Path(os.environ.get(
+    "CAMERA_ALGO_DATA_ROOT", Path(__file__).resolve().parent / "data_source"))
 OUT = ROOT / "detected_results"
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -531,7 +533,12 @@ def main():
 
     ROOT = args.root
     OUT = args.out or ROOT / "detected_results"
-    OUT.mkdir(exist_ok=True)
+    if not ROOT.is_dir():
+        parser.error(
+            f"输入目录不存在: {ROOT}\n"
+            "用 --root 指定，或设置环境变量 CAMERA_ALGO_DATA_ROOT，"
+            "或在仓库下创建 data_source/ 并放入待测视频。")
+    OUT.mkdir(parents=True, exist_ok=True)
     paths = ROOT.rglob("*") if args.recursive else ROOT.iterdir()
     media = [
         path

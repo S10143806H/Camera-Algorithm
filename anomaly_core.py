@@ -17,6 +17,7 @@
 import argparse
 import csv
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -151,9 +152,13 @@ def build_evidence_sheet(video, detector_cls, out_dir, max_frames=40, min_gap=0.
 
 def finalize(video, detector_cls, out_dir):
     video = Path(video); out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     stem = video.stem.encode("ascii", "ignore").decode() or "video"
     det_color = detector_cls.color
-    recs = [json.loads(l) for l in (out_dir / f"{stem}_records.jsonl").open(encoding="utf-8")]
+    rec_file = out_dir / f"{stem}_records.jsonl"
+    # 整段无异常时不会产生 records 文件，按空结果收尾而非抛 FileNotFoundError
+    recs = ([json.loads(l) for l in rec_file.open(encoding="utf-8") if l.strip()]
+            if rec_file.exists() else [])
     seen, uniq = set(), []
     for r in sorted(recs, key=lambda r: r["frame"]):
         if r["frame"] not in seen:
@@ -162,9 +167,16 @@ def finalize(video, detector_cls, out_dir):
     segs = sorted(out_dir.glob(f"{stem}_seg*.mp4"))
     processed = out_dir / f"{stem}_processed.mp4"
     if segs:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError(
+                "未找到 ffmpeg，无法合并分段视频。请先安装：\n"
+                "  Ubuntu/Debian: sudo apt install ffmpeg\n"
+                "  macOS:         brew install ffmpeg\n"
+                "  Windows:       winget install Gyan.FFmpeg")
         lst = out_dir / f"{stem}_list.txt"
         lst.write_text("".join(f"file '{s.resolve()}'\n" for s in segs))
-        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+        subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
                         "-c", "copy", str(processed)], capture_output=True, check=True)
         for s in segs: s.unlink()
         lst.unlink()
