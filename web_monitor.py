@@ -301,7 +301,15 @@ class MonitorService:
 
 # ---------------------------------------------------------------- HTTP
 service: MonitorService = None
+server = None                     # uvicorn.Server，供 /stream 感知退出信号
 app = FastAPI(title="Screen Anomaly Monitor")
+
+
+def _should_stop():
+    """服务要退出了吗。uvicorn 优雅关闭会先等所有连接结束，而 /stream 是
+    无限生成器；不看 server.should_exit 的话，浏览器挂着流时 SIGTERM 会永久
+    挂住，只能 kill -9。"""
+    return (not service) or (not service.running) or (server is not None and server.should_exit)
 
 
 class RoisIn(BaseModel):
@@ -329,15 +337,18 @@ async def stream():
 
     async def gen():
         last = None
-        while service and service.running:
-            jpg = service.snapshot_jpeg()
-            if jpg is not None and jpg is not last:
-                last = jpg
-                yield (b"--" + boundary.encode() + b"\r\n"
-                       b"Content-Type: image/jpeg\r\n"
-                       b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n"
-                       + jpg + b"\r\n")
-            await asyncio.sleep(0.03)
+        try:
+            while not _should_stop():
+                jpg = service.snapshot_jpeg()
+                if jpg is not None and jpg is not last:
+                    last = jpg
+                    yield (b"--" + boundary.encode() + b"\r\n"
+                           b"Content-Type: image/jpeg\r\n"
+                           b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n"
+                           + jpg + b"\r\n")
+                await asyncio.sleep(0.03)
+        except asyncio.CancelledError:      # 客户端断开：正常收尾，不刷栈
+            pass
 
     return StreamingResponse(
         gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
@@ -475,8 +486,13 @@ def main():
     print("   相机被本服务独占，运行期间不要再开 camera_diag.py 预览\n")
 
     import uvicorn
+    global server
+    # 自建 Server 以便 /stream 读到 should_exit；再加优雅关闭超时兜底
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=args.host, port=args.port, log_level="warning",
+        timeout_graceful_shutdown=5))
     try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+        server.run()
     finally:
         service.stop()
     return 0
