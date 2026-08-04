@@ -4,6 +4,14 @@
 
 支持 **Linux / Windows / macOS**，采集后端与设备枚举由 `platform_compat.py` 按平台分派。
 
+| 入口 | 用途 |
+|---|---|
+| `web_monitor.py` | **Web 版实时监控** —— 局域网浏览器看画面、框选 ROI、调相机参数、看事件 |
+| `camera_diag.py` | 本机 GUI 预览 + 摄像头诊断；`--batch` 批量检测视频目录 |
+| `analyze_screen_*.py` | 单类异常离线检测（黑/白/闪/花/冻屏） |
+
+多屏台架下每块屏幕**独立编号 S1/S2/S3、独立判定、独立告警**。
+
 ---
 
 ## 环境要求
@@ -15,6 +23,7 @@
 | NumPy | ≥ 1.24, < 2 | |
 | Pillow | ≥ 10.0 | 仅 `camera/camera_diag.py` 中文叠字用 |
 | ffmpeg | 可选 | 仅 `--finalize` 合并分段视频时需要 |
+| FastAPI + uvicorn | 可选 | 仅 Web 版 `web_monitor.py` 需要 |
 
 ### Linux 安装
 
@@ -36,94 +45,6 @@ pip install -r requirements.txt
 ls -l /dev/video*
 sudo usermod -aG video "$USER"   # 修改后需重新登录生效
 ```
-
----
-
-## 快速开始
-
-### 1. 批量检测视频目录（无 GUI，服务器可用）
-
-```bash
-python3 camera_diag.py --batch data_source --step 3
-```
-
-输出写入 `diag_captures/batch_<日期>/black_screen/`，含 `events_summary.json`。
-
-### 2. 单类异常检测
-
-```bash
-python3 analyze_black_screens.py    --video sample.mp4 --out out/
-python3 analyze_white_screen.py     --video sample.mp4 --out out/
-python3 analyze_screen_flicking.py  --video sample.mp4 --out out/
-python3 analyze_screen_flicking_v4.py --video sample.mp4 --out out/ --finalize
-python3 analyze_screen_distorted.py --video sample.mp4 --out out/
-python3 analyze_screen_freeze.py    --video sample.mp4 --out out/
-```
-
-`--finalize` 会调用 ffmpeg 合并分段视频，未安装时报错并给出安装命令。
-
-### 3. 摄像头诊断 + 实时预览（需要图形界面）
-
-```bash
-python3 camera_diag.py                       # 遍历 backend/fourcc/分辨率找可用画面
-python3 camera_diag.py --device 0 --detect   # 直接开 /dev/video0 并叠加黑屏检测
-python3 camera_diag.py --detect --roi 64,0,896,516
-```
-
-预览快捷键：`Q` 退出 · `SPACE` 暂停 · `D` 检测开关 · `R` 框选 ROI · `C` 自动标定 · `X` 清除 · `S` 存图。
-
-### 4. 多屏台架（画面内同时有多块屏幕）
-
-每块屏幕**独立编号、独立判定、独立事件计数与冷却**，S2 黑屏不会被 S1 的冷却窗口吞掉。
-编号按阅读顺序固定：**上→下、左→右**，与框选先后无关，可跨次复现。
-
-```bash
-python3 camera_diag.py --device 0 --detect --screens 3          # 自动标定最多 3 块屏
-python3 camera_diag.py --device 0 --detect \
-  --roi "20,60,300,200;340,40,320,220;680,70,280,190"           # 固定 3 块 ROI（分号分隔）
-python3 camera_diag.py --batch data_source --screens 3          # 批量模式同样逐屏统计
-```
-
-标定 ROI 的两种方式（预览窗口内）：
-
-| 按键 | 操作 | 适用场景 |
-|---|---|---|
-| `C` | 自动标定：按最大亮度图找出最多 `--screens` 块屏幕 | 屏幕都点亮、轮廓清晰时首选 |
-| `X` | 清除 ROI，回到整幅画面检测 | 标定错了想重来 |
-| `R` | 手动框选：拖框选中一块 → `ENTER` 确认 → 继续拖下一块 → 全部选完按 `ESC` | 自动标定漏检、或只想监控其中几块 |
-
-标定后终端会打印可直接复制的参数，例如：
-
-```
-🖥️ 自动标定出 3 块屏幕:
-   S1: (60, 180, 221, 166)
-   S2: (330, 90, 301, 226)
-   S3: (700, 160, 211, 161)
-可写入 --roi 60,180,221,166;330,90,301,226;700,160,211,161
-```
-
-**输出结构**：事件按屏幕分目录归档，`event.json` 含 `screen_no` / `screen_total` / `screen_roi`。
-
-```
-diag_captures/live_<日期>/black_screen/
-├── screen_1/CAM_<时间>_S1_001/{screenshot.jpg, event.json}
-└── screen_3/CAM_<时间>_S3_002/{screenshot.jpg, event.json}
-```
-
-> `--screens 1` 回到单屏行为。画面里只有一块屏幕时无需改动，自动标定会只返回一块。
-
----
-
-## 平台差异
-
-`platform_compat.py` 统一封装，业务脚本不再含平台分支：
-
-| 能力 | Linux | Windows | macOS |
-|---|---|---|---|
-| 采集后端 | `CAP_V4L2` → `CAP_ANY` | `CAP_MSMF` → `CAP_DSHOW` | `CAP_AVFOUNDATION` → `CAP_ANY` |
-| 设备枚举 | 扫描 `/dev/video*`，名称取自 sysfs | PowerShell `Get-PnpDevice` | 按 index 探测 |
-| 自动曝光 | `3`=自动 / `1`=手动 | `0.75/1`=自动 / `0.25/0`=手动 | `1`/`0` |
-| 中文字体 | Noto CJK / 文泉驿，`fc-match` 兜底 | 微软雅黑 / 黑体 | PingFang / STHeiti |
 
 ---
 
@@ -168,6 +89,109 @@ ROI 会存到 `screen_rois.json`，服务重启后自动载入。
 
 ---
 
+## 快速开始（本机 / 离线）
+
+### 1. 批量检测视频目录（无 GUI，服务器可用）
+
+```bash
+python3 camera_diag.py --batch data_source --step 3
+```
+
+输出写入 `diag_captures/batch_<日期>/black_screen/`，含 `events_summary.json`。
+
+### 2. 单类异常检测
+
+```bash
+python3 analyze_black_screens.py    --video sample.mp4 --out out/
+python3 analyze_white_screen.py     --video sample.mp4 --out out/
+python3 analyze_screen_flicking.py  --video sample.mp4 --out out/
+python3 analyze_screen_flicking_v4.py --video sample.mp4 --out out/ --finalize
+python3 analyze_screen_distorted.py --video sample.mp4 --out out/
+python3 analyze_screen_freeze.py    --video sample.mp4 --out out/
+```
+
+`--finalize` 会调用 ffmpeg 合并分段视频，未安装时报错并给出安装命令。
+
+### 3. 摄像头诊断 + 实时预览（需要图形界面）
+
+```bash
+python3 camera_diag.py                       # 遍历 backend/fourcc/分辨率找可用画面
+python3 camera_diag.py --device 0 --detect   # 直接开 /dev/video0 并叠加黑屏检测
+python3 camera_diag.py --detect --roi 64,0,896,516
+```
+
+预览快捷键：
+
+| 键 | 作用 |
+|---|---|
+| `Q` | 退出 —— **需 3 秒内连按两次**确认（防长时间监控被误触中断） |
+| `ESC` | **不退出程序**；仅在框选模式下作"取消框选" |
+| `SPACE` | 暂停 / 继续 |
+| `D` | 检测开关 |
+| `R` | 进入框选模式（不阻塞，画面持续刷新） |
+| `C` | 自动标定多屏 ROI，**按下立即生效，无需确认** |
+| `X` | 清除 ROI，回到整幅画面检测 |
+| `S` | 保存当前帧截图到 `diag_captures/` |
+
+误点窗口关闭按钮不会结束监控 —— 窗口会自动重建，检测循环不中断。
+
+### 4. 多屏台架（画面内同时有多块屏幕）
+
+每块屏幕**独立编号、独立判定、独立事件计数与冷却**，S2 黑屏不会被 S1 的冷却窗口吞掉。
+编号按阅读顺序固定：**上→下、左→右**，与框选先后无关，可跨次复现。
+
+```bash
+python3 camera_diag.py --device 0 --detect --screens 3          # 自动标定最多 3 块屏
+python3 camera_diag.py --device 0 --detect \
+  --roi "20,60,300,200;340,40,320,220;680,70,280,190"           # 固定 3 块 ROI（分号分隔）
+python3 camera_diag.py --batch data_source --screens 3          # 批量模式同样逐屏统计
+```
+
+标定 ROI 的两种方式（预览窗口内）：
+
+| 按键 | 操作 | 适用场景 |
+|---|---|---|
+| `C` | 自动标定，按下立即生效 | 首选。相机模式下**启动后等约 20 秒**再按，标定缓存填满后最准 |
+| `R` | 进入框选模式：鼠标拖框加一块 → 继续拖下一块 → `ENTER` 应用 / `BACKSPACE` 撤销 / `ESC` 取消 | 自动标定漏检、或只想监控其中几块 |
+| `X` | 清除 ROI，回到整幅画面检测 | 标定错了想重来 |
+
+> 框选模式**不阻塞**：画面持续刷新、检测继续运行，其它快捷键在退出框选后恢复。
+
+标定后终端会打印可直接复制的参数，例如：
+
+```
+🖥️ 自动标定出 3 块屏幕:
+   S1: (60, 180, 221, 166)
+   S2: (330, 90, 301, 226)
+   S3: (700, 160, 211, 161)
+可写入 --roi 60,180,221,166;330,90,301,226;700,160,211,161
+```
+
+**输出结构**：事件按屏幕分目录归档，`event.json` 含 `screen_no` / `screen_total` / `screen_roi`。
+
+```
+diag_captures/live_<日期>/black_screen/
+├── screen_1/CAM_<时间>_S1_001/{screenshot.jpg, event.json}
+└── screen_3/CAM_<时间>_S3_002/{screenshot.jpg, event.json}
+```
+
+> `--screens 1` 回到单屏行为。画面里只有一块屏幕时无需改动，自动标定会只返回一块。
+
+---
+
+## 平台差异
+
+`platform_compat.py` 统一封装，业务脚本不再含平台分支：
+
+| 能力 | Linux | Windows | macOS |
+|---|---|---|---|
+| 采集后端 | `CAP_V4L2` → `CAP_ANY` | `CAP_MSMF` → `CAP_DSHOW` | `CAP_AVFOUNDATION` → `CAP_ANY` |
+| 设备枚举 | 扫描 `/dev/video*`，名称取自 sysfs | PowerShell `Get-PnpDevice` | 按 index 探测 |
+| 自动曝光 | `3`=自动 / `1`=手动 | `0.75/1`=自动 / `0.25/0`=手动 | `1`/`0` |
+| 中文字体 | Noto CJK / 文泉驿，`fc-match` 兜底 | 微软雅黑 / 黑体 | PingFang / STHeiti |
+
+---
+
 ## 飞书告警（可选）
 
 ```bash
@@ -195,6 +219,8 @@ python3 notify/feishu_notifier.py --test
 | `--finalize` 报未找到 ffmpeg | 未安装 ffmpeg | `sudo apt install ffmpeg`；无 sudo 时 `pip install imageio-ffmpeg` 后将其二进制软链到 PATH |
 | Wayland 下预览窗口异常 | Qt 后端不匹配 | `export QT_QPA_PLATFORM=xcb` 后重跑 |
 | `createTrackbar` 报 `NULL window handler` | 窗口句柄名含非 ASCII 字符 | Linux 的 Qt highgui 后端不支持，句柄名保持 ASCII，中文用 `cv2.setWindowTitle` 设置 |
+| Web 版报相机打不开 | 相机被 `camera_diag.py` 预览占用 | 同一时刻只能一个进程持有相机，先 `pkill -f camera_diag.py` |
+| 网页打得开但画面不动 | 防火墙放行了 80/443 未放行服务端口 | 放行该端口，或换 `--port`；`curl http://<IP>:8000/api/status` 先验证 |
 
 查看相机支持的格式与分辨率：
 
