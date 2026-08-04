@@ -402,9 +402,11 @@ def preview_loop(cap, info, args):
                 print(f"  检测 -> {'开' if detect_on else '关'}")
         elif key in (ord('r'), ord('R')):
             # 多屏框选：逐块拖框后回车确认下一块，ESC 结束
-            print(f"  🖥️ 框选每块屏幕：拖框后按 ENTER 确认下一块，全部选完按 ESC "
-                  f"(最多 {max_screens} 块)")
-            sels = cv2.selectROIs(win, frame, showCrosshair=True)
+            print(f"  🖥️ 框选每块屏幕：拖框 → ENTER/SPACE 确认这一块 → 继续拖下一块 "
+                  f"→ 全部选完按 ESC   (最多 {max_screens} 块, c 键取消当前框)")
+            # printNotice=False：关掉 OpenCV 自带的英文提示，否则每选一块就重复刷屏
+            sels = cv2.selectROIs(win, frame, showCrosshair=True,
+                                  fromCenter=False, printNotice=False)
             picked = [tuple(int(v) for v in s) for s in sels if s[2] > 10 and s[3] > 10]
             if picked:
                 screen_rois = order_rois(picked)[:max_screens]

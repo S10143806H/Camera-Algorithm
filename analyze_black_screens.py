@@ -43,47 +43,114 @@ def _reading_order(rois):
     return out
 
 
-def rois_from_maxbright(max_bright, max_screens=3, min_area_frac=0.01):
-    """由逐像素最大亮度图求屏幕 bbox 列表（支持画面内多块屏幕）。
+# 形态学核：先开后闭、核要小。核过大(旧值 23)会把屏幕与相邻亮墙桥接成一整块。
+_MORPH_KSIZE = 7
+# 单块区域占画面比例超过此值即判为退化结果（阈值太低把整幅画面圈成一块）
+_DEGENERATE_FRAC = 0.6
 
-    max_screens=1 时等价于旧的单屏行为（取最大亮块）。
-    返回按阅读顺序排序的 [(x, y, w, h), ...]，标定失败返回 []。
-    """
+
+# 屏幕判据（明亮环境下把屏幕从白墙里分出来的关键）：
+#   矩形度 —— 屏幕是规整矩形，墙面亮区轮廓破碎
+#   边框对比 —— 屏幕有黑色 bezel，框外一圈明显比框内暗；墙的邻域还是墙，对比很小
+_MIN_FILL = 0.72
+_MIN_RING_CONTRAST = 55.0
+_RING_BAND = 14
+
+
+def _ring_contrast(max_bright, box, band=_RING_BAND):
+    """框内平均亮度 - 框外一圈平均亮度。屏幕因黑边框而显著为正。"""
     h, w = max_bright.shape
-    mask = (max_bright > 90).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (23, 23))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    x, y, bw, bh = box
+    inner_sum = float(max_bright[y:y + bh, x:x + bw].sum())
+    x0, y0 = max(0, x - band), max(0, y - band)
+    x1, y1 = min(w, x + bw + band), min(h, y + bh + band)
+    outer_sum = float(max_bright[y0:y1, x0:x1].sum()) - inner_sum
+    outer_cnt = (y1 - y0) * (x1 - x0) - bw * bh
+    if outer_cnt <= 0:
+        return 0.0
+    return inner_sum / max(1, bw * bh) - outer_sum / outer_cnt
+
+
+def _extract_boxes(max_bright, thr, min_area_frac):
+    """按给定阈值提取候选屏幕框，返回 [(box, area, fill, ring), ...]。"""
+    h, w = max_bright.shape
+    mask = (max_bright > thr).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (_MORPH_KSIZE, _MORPH_KSIZE))
+    # 先开运算切断屏幕与亮墙之间的细连接，再闭运算补屏幕内部的暗区
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    cands, fallback = [], []
+    boxes = []
     for contour in contours:
         x, y, bw, bh = cv2.boundingRect(contour)
         area = bw * bh
-        box = (int(x), int(y), int(bw), int(bh))
-        if area >= 0.05 * w * h:
-            fallback.append((box, area))
         if area < min_area_frac * w * h:
             continue
         # 排除细长的反光条/桌沿：屏幕长宽比通常在 0.4~5 之间
         ar = bw / max(1, bh)
         if not (0.4 <= ar <= 5.0):
             continue
-        # 排除轮廓填充率过低的非矩形亮区
-        if cv2.contourArea(contour) < 0.45 * area:
+        fill = cv2.contourArea(contour) / max(1, area)
+        if fill < _MIN_FILL:
             continue
-        cands.append((box, area))
+        box = (int(x), int(y), int(bw), int(bh))
+        ring = _ring_contrast(max_bright, box)
+        if ring < _MIN_RING_CONTRAST:
+            continue
+        boxes.append((box, area, fill, ring))
+    return boxes
 
-    # 形状过滤把所有候选都滤掉时，退回旧的“最大亮块 ≥5% 画面”规则
-    if not cands:
-        cands = fallback
-    if not cands:
+
+def _score_boxes(boxes, frame_area, max_screens):
+    """给一组候选打分：找齐的屏幕块数优先，其次矩形度与边框对比。
+
+    出现铺满画面的退化块直接判负分，用于自动淘汰过低的阈值。
+    """
+    if not boxes:
+        return -1.0
+    if max(b[1] for b in boxes) > _DEGENERATE_FRAC * frame_area:
+        return -1.0
+    top = sorted(boxes, key=lambda b: -b[1])[:max_screens]
+    # 块数是主项：宁可多找出一块屏，也不追求单块面积最大。
+    # 次项取整组里最"不像屏幕"的那块——一组候选的可信度由最弱成员决定，
+    # 用均值会让一块高分屏掩盖掺进来的墙面亮区。
+    weakest = min(fill * min(ring / 255.0, 1.0) for _, _, fill, ring in top)
+    return len(top) + weakest
+
+
+def rois_from_maxbright(max_bright, max_screens=3, min_area_frac=0.01):
+    """由逐像素最大亮度图求屏幕 bbox 列表（支持画面内多块屏幕）。
+
+    亮度阈值自适应：固定 90 只适用于暗机房，明亮实验室里白墙也 >90，
+    会把整幅画面圈成一块。这里按画面亮度分位数生成一组候选阈值，
+    逐个提取并打分，取得分最高的一组，自动淘汰"整幅画面"式的退化结果。
+
+    max_screens=1 时取面积最大的一块。返回按阅读顺序排序的
+    [(x, y, w, h), ...]，标定失败返回 []。
+    """
+    h, w = max_bright.shape
+    frame_area = h * w
+    cands = {90}                                    # 暗环境沿用旧阈值
+    cands |= {int(np.percentile(max_bright, p))     # 亮环境按分位数抬高
+              for p in (50, 60, 70, 75, 80, 85, 88, 91, 94, 97)}
+
+    best, best_score = [], -1.0
+    for thr in sorted(c for c in cands if 40 <= c <= 250):
+        boxes = _extract_boxes(max_bright, thr, min_area_frac)
+        score = _score_boxes(boxes, frame_area, max_screens)
+        if score > best_score:
+            best_score = score
+            best = [b[0] for b in sorted(boxes, key=lambda b: -b[1])[:max_screens]]
+
+    if best_score > 0:
+        return _reading_order(best)
+
+    # 所有阈值都退化：退回旧的"最大亮块 ≥5% 画面"规则，至少给出一块
+    boxes = _extract_boxes(max_bright, 90, 0.05)
+    if not boxes:
         return []
-    cands.sort(key=lambda c: c[1], reverse=True)
-    # 只保留与最大屏幕面积相差不超过 15 倍的块，滤掉零星小亮点
-    biggest = cands[0][1]
-    kept = [roi for roi, area in cands[:max_screens] if area * 15 >= biggest]
-    return _reading_order(kept)
+    return [max(boxes, key=lambda b: b[1])[0]]
 
 
 def calibrate_screen_rois(video_path, samples=40, max_screens=3):

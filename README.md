@@ -89,6 +89,7 @@ python3 camera_diag.py --batch data_source --screens 3          # 批量模式�
 | 按键 | 操作 | 适用场景 |
 |---|---|---|
 | `C` | 自动标定：按最大亮度图找出最多 `--screens` 块屏幕 | 屏幕都点亮、轮廓清晰时首选 |
+| `X` | 清除 ROI，回到整幅画面检测 | 标定错了想重来 |
 | `R` | 手动框选：拖框选中一块 → `ENTER` 确认 → 继续拖下一块 → 全部选完按 `ESC` | 自动标定漏检、或只想监控其中几块 |
 
 标定后终端会打印可直接复制的参数，例如：
@@ -148,6 +149,8 @@ python3 notify/feishu_notifier.py --test
 | `ImportError: libGL.so.1` | 缺 GUI 运行库 | `sudo apt install libgl1`，或改装 `opencv-python-headless` |
 | `cv2.imshow` 报 `not implemented` | 装的是 headless 版 | 预览需 `opencv-python`；批量检测不受影响 |
 | 中文叠字显示为方块 | 缺 CJK 字体 | `sudo apt install fonts-noto-cjk` |
+| `C` 标定出整幅画面 `(0,0,W,H)` | 环境过亮，白墙也被判为屏幕 | 已由自适应阈值 + 边框对比修正；仍失败时用 `R` 手动框选并把打印的 `--roi` 固定下来 |
+| `C` 漏掉某块屏 | 该屏 bezel 太浅或亮度接近背景 | 用 `R` 手动补框；或把该屏内容切到亮画面后重标定 |
 | `--finalize` 报未找到 ffmpeg | 未安装 ffmpeg | `sudo apt install ffmpeg`；无 sudo 时 `pip install imageio-ffmpeg` 后将其二进制软链到 PATH |
 | Wayland 下预览窗口异常 | Qt 后端不匹配 | `export QT_QPA_PLATFORM=xcb` 后重跑 |
 | `createTrackbar` 报 `NULL window handler` | 窗口句柄名含非 ASCII 字符 | Linux 的 Qt highgui 后端不支持，句柄名保持 ASCII，中文用 `cv2.setWindowTitle` 设置 |
