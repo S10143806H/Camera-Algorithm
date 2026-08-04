@@ -14,6 +14,89 @@
 
 ---
 
+## 命令速查
+
+### 装环境（一次）
+
+```bash
+sudo apt install -y python3-venv ffmpeg libgl1 libglib2.0-0 fonts-noto-cjk v4l-utils
+sudo usermod -aG video "$USER"          # 加入 video 组，需重新登录生效
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Web 版实时监控（远程访问，推荐）
+
+```bash
+python3 web_monitor.py --device 0 --screens 3      # 启动，默认 0.0.0.0:8000
+python3 web_monitor.py --port 8080                 # 换端口
+python3 web_monitor.py --device 0 --notify         # 事件推飞书
+pkill -f "[w]eb_monitor.py"                        # 停止（方括号防 pkill 自匹配）
+curl http://127.0.0.1:8000/api/status              # 健康检查
+```
+
+启动后终端打印访问地址，另一台 PC 浏览器直接打开即可框选 ROI、调参数、看事件。
+
+### 本机 GUI 预览
+
+```bash
+python3 camera_diag.py                             # 诊断：遍历后端/格式/分辨率找可用画面
+python3 camera_diag.py --device 0 --detect --screens 3        # 直接开相机 + 多屏检测
+python3 camera_diag.py --detect --roi "433,95,307,182;472,285,248,72;301,467,520,253"
+python3 camera_diag.py --video ticket.mp4 --detect  # 回放问题单视频
+```
+
+窗口内：`C` 自动标定 · `R` 框选 ROI · `D` 检测开关 · `X` 清除 · `S` 存图 · `Q` **连按两次**退出。
+
+### 批量 / 离线检测（无 GUI，服务器可跑）
+
+```bash
+python3 camera_diag.py --batch data_source --step 3 --screens 3   # 目录内全部视频
+python3 camera_diag.py --batch one.mp4 --out out/                 # 单个视频
+python3 analyze_black_screens.py --root ./data_source --recursive # 黑屏专项
+python3 analyze_white_screen.py     --video x.mp4 --out out/      # 白屏
+python3 analyze_screen_flicking_v4.py --video x.mp4 --out out/ --finalize  # 闪屏
+python3 analyze_screen_distorted.py --video x.mp4 --out out/      # 花屏
+python3 analyze_screen_freeze.py    --video x.mp4 --out out/      # 冻屏
+```
+
+### 飞书告警
+
+```bash
+cp set_feishu_env.sh.example set_feishu_env.sh     # 填入 webhook 后
+source set_feishu_env.sh
+python3 notify/feishu_notifier.py --test           # 自测
+```
+
+### 排查
+
+```bash
+ls -l /dev/video*                                  # 设备与权限
+v4l2-ctl --list-devices                            # 相机列表
+v4l2-ctl -d /dev/video0 --list-formats-ext         # 支持的格式与分辨率
+fuser -v /dev/video0                               # 谁占着相机
+export QT_QPA_PLATFORM=xcb                         # Wayland 下预览窗口异常时
+```
+
+### 常用参数
+
+| 参数 | 适用 | 说明 |
+|---|---|---|
+| `--device N` | `camera_diag` `web_monitor` | 直接开第 N 个相机，跳过诊断 |
+| `--screens N` | `camera_diag` `web_monitor` | 最多识别几块屏幕，默认 3；设 `1` 为单屏行为 |
+| `--roi "x,y,w,h;..."` | `camera_diag` `web_monitor` | 固定 ROI，多块用分号分隔 |
+| `--detect` | `camera_diag` | 开启黑屏检测叠加（Web 版默认开，用 `--no-detect` 关） |
+| `--batch PATH` | `camera_diag` | 目录或单个视频，无 GUI |
+| `--step N` | `camera_diag --batch` | 每 N 帧检测一次，加速 |
+| `--notify` | `camera_diag` `web_monitor` | 生成事件后推飞书 |
+| `--out DIR` | `camera_diag --batch`、`analyze_*` | 输出目录 |
+| `--port` / `--host` | `web_monitor` | 监听端口 / 地址，默认 `0.0.0.0:8000` |
+| `--quality N` | `web_monitor` | MJPEG 质量 1–100，默认 75；带宽紧张可调低 |
+| `--finalize` | `analyze_screen_*` | 合并分段视频 + 生成证据图（需 ffmpeg） |
+| `--recursive` | `analyze_black_screens` | 递归扫描 `--root` 子目录 |
+
+---
+
 ## 环境要求
 
 | 项 | 要求 | 说明 |
