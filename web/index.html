@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>屏幕异常实时监控</title>
+<style>
+  :root{
+    --bg:#11141a; --panel:#1a1f29; --line:#2b3240; --fg:#e6eaf2; --dim:#8e99ad;
+    --ok:#2ecc71; --bad:#ff4d4f; --accent:#00a0ff; --warn:#ffa940;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 system-ui,"Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+         padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .pill{padding:2px 10px;border-radius:99px;background:#232a36;color:var(--dim);font-size:12px}
+  .pill.ok{background:rgba(46,204,113,.15);color:var(--ok)}
+  .pill.bad{background:rgba(255,77,79,.18);color:var(--bad)}
+  main{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;padding:16px;align-items:start}
+  @media(max-width:1000px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .card h2{font-size:13px;margin:0;padding:10px 14px;border-bottom:1px solid var(--line);
+           color:var(--dim);font-weight:600;letter-spacing:.04em}
+  .card .body{padding:14px}
+  #stage{position:relative;line-height:0;background:#000}
+  #stage img{width:100%;height:auto;display:block}
+  #overlay{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px;border-top:1px solid var(--line)}
+  button{background:#232a36;color:var(--fg);border:1px solid var(--line);border-radius:7px;
+         padding:7px 13px;font-size:13px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#04121e;font-weight:600}
+  button.danger{color:var(--bad)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .hint{color:var(--dim);font-size:12px;padding:0 14px 12px}
+  .row{display:flex;align-items:center;gap:10px;margin-bottom:11px}
+  .row label{width:96px;color:var(--dim);font-size:12px;flex:none}
+  .row input[type=range]{flex:1;accent-color:var(--accent)}
+  .row .val{width:38px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500}
+  .sn{display:inline-block;min-width:26px;padding:1px 7px;border-radius:5px;
+      background:#232a36;font-weight:600;font-size:12px}
+  .sn.bad{background:var(--bad);color:#fff}
+  .sn.ok{background:rgba(46,204,113,.18);color:var(--ok)}
+  #events{max-height:340px;overflow:auto}
+  #events img{width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--line)}
+  .ev{padding:10px 14px;border-bottom:1px solid var(--line)}
+  .ev .t{color:var(--dim);font-size:11px}
+  code{background:#232a36;padding:2px 6px;border-radius:5px;font-size:11.5px;
+       word-break:break-all;display:inline-block}
+  .empty{color:var(--dim);padding:14px;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>屏幕异常实时监控</h1>
+  <span class="pill" id="p-dev">相机 —</span>
+  <span class="pill" id="p-fps">— fps</span>
+  <span class="pill" id="p-detect">检测 —</span>
+  <span class="pill" id="p-alert">告警 —</span>
+</header>
+
+<main>
+  <div>
+    <div class="card">
+      <h2>实时画面</h2>
+      <div id="stage">
+        <img id="video" src="/stream" alt="live">
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="toolbar">
+        <button class="primary" id="btn-select">框选 ROI</button>
+        <button id="btn-calib">自动标定</button>
+        <button id="btn-apply" disabled>应用</button>
+        <button id="btn-undo" disabled>撤销上一块</button>
+        <button id="btn-cancel" disabled>取消</button>
+        <button class="danger" id="btn-clear">清除 ROI</button>
+        <button id="btn-detect">检测开关</button>
+      </div>
+      <div class="hint" id="hint">
+        点「框选 ROI」后在画面上拖框，每拖一次添加一块屏幕，点「应用」生效。
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <h2>屏幕状态</h2>
+      <div class="body" style="padding:0">
+        <table id="screens"><tbody><tr><td class="empty">未标定 ROI，按整幅画面检测</td></tr></tbody></table>
+      </div>
+      <div class="hint" style="padding:10px 14px">
+        <div id="roi-arg"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h2>相机参数</h2>
+      <div class="body" id="params"><div class="empty">加载中…</div></div>
+      <div class="hint">黑屏检测建议：AutoExp 设 0（手动）后固定 Exposure，Gain 调低。</div>
+    </div>
+
+    <div class="card">
+      <h2>事件 <span id="ev-count" class="pill">0</span></h2>
+      <div id="events"><div class="empty">暂无事件</div></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const video = $('#video'), cv = $('#overlay'), ctx = cv.getContext('2d');
+
+let state = {rois: [], screens: [], w: 0, h: 0};
+let selecting = false, drawing = false, pending = [], p0 = null, p1 = null;
+
+/* ---------- 画布与图像坐标互转（画面按宽度自适应缩放） ---------- */
+function fitCanvas(){
+  const r = video.getBoundingClientRect();
+  if (!r.width) return;
+  cv.width = r.width; cv.height = r.height;
+  draw();
+}
+function toImg(px, py){
+  const sx = state.w / cv.width, sy = state.h / cv.height;
+  return [Math.round(px * sx), Math.round(py * sy)];
+}
+function toCanvas(x, y, w, h){
+  const sx = cv.width / state.w, sy = cv.height / state.h;
+  return [x * sx, y * sy, w * sx, h * sy];
+}
+
+function draw(){
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (!state.w) return;
+  if (selecting){
+    ctx.lineWidth = 2; ctx.strokeStyle = '#ffd93d'; ctx.font = 'bold 15px sans-serif';
+    pending.forEach((b, i) => {
+      const [x, y, w, h] = toCanvas(...b);
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = '#ffd93d'; ctx.fillText('S' + (i + 1), x + 5, y + 18);
+    });
+    if (drawing && p0 && p1){
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(Math.min(p0[0], p1[0]), Math.min(p0[1], p1[1]),
+                     Math.abs(p1[0] - p0[0]), Math.abs(p1[1] - p0[1]));
+      ctx.setLineDash([]);
+    }
+  }
+}
+
+/* ---------- 鼠标框选 ---------- */
+cv.addEventListener('pointerdown', e => {
+  if (!selecting) return;
+  const r = cv.getBoundingClientRect();
+  drawing = true; p0 = [e.clientX - r.left, e.clientY - r.top]; p1 = p0.slice();
+  cv.setPointerCapture(e.pointerId);
+});
+cv.addEventListener('pointermove', e => {
+  if (!selecting || !drawing) return;
+  const r = cv.getBoundingClientRect();
+  p1 = [e.clientX - r.left, e.clientY - r.top]; draw();
+});
+cv.addEventListener('pointerup', () => {
+  if (!selecting || !drawing) return;
+  drawing = false;
+  const [x0, y0] = toImg(Math.min(p0[0], p1[0]), Math.min(p0[1], p1[1]));
+  const [x1, y1] = toImg(Math.max(p0[0], p1[0]), Math.max(p0[1], p1[1]));
+  const box = [x0, y0, x1 - x0, y1 - y0];
+  if (box[2] > 10 && box[3] > 10) pending.push(box);
+  p0 = p1 = null; refreshSelUI(); draw();
+});
+
+function refreshSelUI(){
+  $('#btn-apply').disabled = !selecting || !pending.length;
+  $('#btn-undo').disabled  = !selecting || !pending.length;
+  $('#btn-cancel').disabled = !selecting;
+  $('#btn-select').textContent = selecting ? `框选中 ${pending.length} 块` : '框选 ROI';
+  $('#hint').textContent = selecting
+    ? `已框 ${pending.length} 块：继续在画面上拖框添加，点「应用」生效，「撤销」删掉最后一块。`
+    : '点「框选 ROI」后在画面上拖框，每拖一次添加一块屏幕，点「应用」生效。';
+}
+
+/* ---------- 后端交互 ---------- */
+async function api(path, method = 'GET', body){
+  const r = await fetch(path, {
+    method,
+    headers: body ? {'Content-Type': 'application/json'} : undefined,
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+}
+
+$('#btn-select').onclick = () => { selecting = true; pending = []; refreshSelUI(); draw(); };
+$('#btn-cancel').onclick = () => { selecting = false; pending = []; refreshSelUI(); draw(); };
+$('#btn-undo').onclick   = () => { pending.pop(); refreshSelUI(); draw(); };
+$('#btn-apply').onclick  = async () => {
+  try { await api('/api/rois', 'POST', {rois: pending}); }
+  catch (e) { alert('应用失败: ' + e.message); return; }
+  selecting = false; pending = []; refreshSelUI(); draw(); poll();
+};
+$('#btn-calib').onclick = async () => {
+  $('#btn-calib').disabled = true;
+  try { const r = await api('/api/rois/calibrate', 'POST');
+        $('#hint').textContent = `自动标定出 ${r.rois.length} 块屏幕`; }
+  catch (e) { alert('自动标定失败: ' + e.message); }
+  $('#btn-calib').disabled = false; poll();
+};
+$('#btn-clear').onclick = async () => { await api('/api/rois', 'DELETE'); poll(); };
+$('#btn-detect').onclick = async () => {
+  const s = await api('/api/status');
+  await api('/api/detect', 'POST', {on: !s.detect_on}); poll();
+};
+
+/* ---------- 相机参数 ---------- */
+async function loadParams(){
+  const {params} = await api('/api/camera');
+  $('#params').innerHTML = params.map(p => `
+    <div class="row">
+      <label title="${p.name}">${p.name}</label>
+      <input type="range" min="0" max="${p.max}" value="${p.value}" data-name="${p.name}">
+      <span class="val">${p.value}</span>
+    </div>`).join('');
+  $('#params').querySelectorAll('input[type=range]').forEach(el => {
+    el.addEventListener('input', () => el.nextElementSibling.textContent = el.value);
+    el.addEventListener('change', async () => {
+      try { await api('/api/camera', 'POST', {name: el.dataset.name, value: +el.value}); }
+      catch (e) { alert('设置失败: ' + e.message); }
+    });
+  });
+}
+
+/* ---------- 轮询状态与事件 ---------- */
+async function poll(){
+  let s;
+  try { s = await api('/api/status'); } catch { return; }
+  state.rois = s.rois; state.screens = s.screens;
+  state.w = s.width || video.naturalWidth; state.h = s.height || video.naturalHeight;
+
+  $('#p-dev').textContent = `相机 ${s.device} · ${s.backend} · ${s.width}x${s.height}`;
+  $('#p-fps').textContent = `${s.fps} fps`;
+  const d = $('#p-detect');
+  d.textContent = '检测 ' + (s.detect_on ? '开' : '关');
+  d.className = 'pill ' + (s.detect_on ? 'ok' : '');
+  const bad = s.screens.filter(x => x.abnormal).map(x => 'S' + x.no);
+  const a = $('#p-alert');
+  a.textContent = bad.length ? '告警 ' + bad.join(',') : '告警 无';
+  a.className = 'pill ' + (bad.length ? 'bad' : 'ok');
+
+  const tb = $('#screens').querySelector('tbody');
+  tb.innerHTML = s.screens.length
+    ? '<tr><th>屏幕</th><th>状态</th><th>暗像素</th><th>ROI</th></tr>' + s.screens.map(x => `
+        <tr><td><span class="sn ${x.abnormal ? 'bad' : 'ok'}">S${x.no || '全'}</span></td>
+            <td>${x.abnormal ? '<b style="color:var(--bad)">BLACK</b>' : 'ok'}</td>
+            <td>${x.dark_pct}%</td>
+            <td style="color:var(--dim)">${x.roi ? x.roi.join(',') : '整幅画面'}</td></tr>`).join('')
+    : '<tr><td class="empty">未标定 ROI，按整幅画面检测</td></tr>';
+  $('#roi-arg').innerHTML = s.roi_arg
+    ? `命令行参数：<code>--roi ${s.roi_arg}</code>` : '未设置 ROI';
+
+  $('#ev-count').textContent = s.event_count;
+  fitCanvas();
+}
+
+async function pollEvents(){
+  let evs;
+  try { evs = (await api('/api/events?limit=20')).events; } catch { return; }
+  $('#events').innerHTML = evs.length ? evs.map(e => `
+    <div class="ev">
+      <div><span class="sn bad">S${e.screen_no || '全'}</span>
+           <b style="color:var(--bad)">BLACK SCREEN</b>
+           <span class="t">score ${e.score} · ${e.frame_count} 帧</span></div>
+      <div class="t">${(e.capture_time || '').replace('T', ' ').slice(0, 23)}</div>
+      <img loading="lazy" src="/api/events/${e.event_id}/screenshot">
+    </div>`).join('') : '<div class="empty">暂无事件</div>';
+}
+
+addEventListener('resize', fitCanvas);
+video.addEventListener('load', fitCanvas);
+refreshSelUI(); loadParams(); poll(); pollEvents();
+setInterval(poll, 1000);
+setInterval(pollEvents, 5000);
+</script>
+</body>
+</html>

@@ -9,3 +9,8 @@
 opencv-python>=4.8
 numpy>=1.24,<2
 pillow>=10.0
+
+# Web 版监控（web_monitor.py）额外需要：
+#   pip install fastapi "uvicorn[standard]"
+fastapi>=0.110
+uvicorn[standard]>=0.27

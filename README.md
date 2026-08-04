@@ -127,6 +127,47 @@ diag_captures/live_<日期>/black_screen/
 
 ---
 
+## Web 版实时监控（局域网浏览器访问）
+
+`web_monitor.py` 把采集 + 多屏检测跑成后台服务，另一台 PC 用浏览器直接看和操作，无需安装任何东西。
+
+```bash
+pip install fastapi "uvicorn[standard]"
+python3 web_monitor.py --device 0 --screens 3        # 默认 0.0.0.0:8000
+```
+
+启动后终端打印访问地址，例如 `http://10.0.0.5:8000/`。
+
+网页可完成的操作：
+
+| 功能 | 说明 |
+|---|---|
+| 实时画面 | MJPEG 流，带 S1/S2/S3 标注，异常屏幕红框高亮 |
+| 框选 ROI | 点「框选 ROI」后在画面上拖框，每拖一次加一块，「应用」生效 |
+| 自动标定 | 一键调用同一套多屏标定算法 |
+| 相机参数 | 亮度/对比度/饱和度/增益/曝光/对焦/自动曝光，滑动即生效 |
+| 事件列表 | 每 5 秒刷新，含证据截图、屏幕编号、score |
+
+ROI 会存到 `screen_rois.json`，服务重启后自动载入。
+
+### HTTP 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/stream` | MJPEG 实时流 |
+| GET | `/api/snapshot` | 当前帧单张 JPEG（可做健康检查） |
+| GET | `/api/status` | 分辨率、fps、各屏状态、当前 ROI |
+| GET/POST/DELETE | `/api/rois` | 读取 / 设置 / 清除 ROI |
+| POST | `/api/rois/calibrate` | 自动标定多屏 |
+| GET/POST | `/api/camera` | 读取 / 设置相机参数 |
+| POST | `/api/detect` | 检测开关 |
+| GET | `/api/events` | 事件列表 |
+| GET | `/api/events/{id}/screenshot` | 事件证据截图 |
+
+> **相机独占**：同一时刻只能有一个进程打开相机。Web 服务运行期间不要再开 `camera_diag.py` 预览，反之亦然。
+
+---
+
 ## 飞书告警（可选）
 
 ```bash
