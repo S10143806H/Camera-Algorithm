@@ -85,6 +85,15 @@ ROI 会存到 `screen_rois.json`，服务重启后自动载入。
 | GET | `/api/events` | 事件列表 |
 | GET | `/api/events/{id}/screenshot` | 事件证据截图 |
 
+停止服务：
+
+```bash
+pkill -f "[w]eb_monitor.py"
+```
+
+> 方括号写法是为了避免 `pkill` 匹配到自己所在的 shell —— 直接写 `pkill -f web_monitor.py`
+> 会因为该字符串出现在自身命令行里而先把发起命令的 shell 杀掉。
+
 > **相机独占**：同一时刻只能有一个进程打开相机。Web 服务运行期间不要再开 `camera_diag.py` 预览，反之亦然。
 
 ---
