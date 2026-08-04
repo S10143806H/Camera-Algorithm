@@ -24,7 +24,7 @@ USB2.0 摄像头诊断 + 黑屏检测预览工具
   python3 camera_diag.py --detect --roi 20,60,300,200;340,40,320,220;680,70,280,190
 
 预览快捷键:
-  Q 退出        SPACE 暂停/继续      . 单帧步进(视频)   , 单帧步退(视频)
+  Q 退出(3秒内连按两次确认)   SPACE 暂停/继续   . 单帧步进(视频)   , 单帧步退(视频)
   D 检测开/关   R 进入框选模式(非阻塞)  C 自动标定多屏ROI  X 清除ROI
   S 保存当前帧截图(diag_captures/)
   R 用法: 鼠标拖框添加一块 → 继续拖下一块 → ENTER 应用 / BACKSPACE 撤销 / ESC 取消
@@ -292,6 +292,9 @@ def preview_loop(cap, info, args):
     last_calib_sample = 0.0
     save_dir = Path(__file__).resolve().parent / "diag_captures"
     paused = False
+    # 防误退：ESC 不再退出，Q 需要在 QUIT_CONFIRM_S 秒内连按两次
+    QUIT_CONFIRM_S = 3.0
+    quit_armed_until = 0.0
     step = 0
     frame = None
     result = None
@@ -424,7 +427,23 @@ def preview_loop(cap, info, args):
             status += "  [PAUSED]"
         cv2.putText(display, status, (10, display.shape[0] - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+        if quit_armed_until > time.time():
+            _put_text_clamped(display, "QUIT?  press Q again to confirm  |  any other key = cancel",
+                              12, display.shape[0] // 2, 0.85, (0, 0, 255), 3)
+
         cv2.imshow(win, display)
+
+        # 误点窗口关闭按钮不应结束监控：重建窗口(连同滑条与鼠标回调)继续跑
+        try:
+            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                print("  ⚠️ 预览窗口被关闭，已重新打开（退出请连按两次 Q）")
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+                cv2.setWindowTitle(win, title)
+                if not is_video:
+                    setup_trackbars(win, cap)
+                cv2.setMouseCallback(win, on_mouse)
+        except cv2.error:
+            pass
 
         # ---- 按键 ----
         key = cv2.waitKey(1 if not paused else 30) & 0xFF
@@ -450,8 +469,19 @@ def preview_loop(cap, info, args):
                     sel["boxes"].pop()
             continue
 
-        if key in (ord('q'), ord('Q'), 27):
-            break
+        # 任意其它按键都取消待确认的退出
+        if quit_armed_until and key != 255 and key not in (ord('q'), ord('Q')):
+            quit_armed_until = 0.0
+            print("  已取消退出")
+
+        if key in (ord('q'), ord('Q')):
+            if time.time() < quit_armed_until:
+                break
+            quit_armed_until = time.time() + QUIT_CONFIRM_S
+            print(f"  ⚠️ 确认退出？{QUIT_CONFIRM_S:.0f} 秒内再按一次 Q 退出，按其它任意键取消")
+        elif key == 27:
+            # ESC 最容易误触，不再绑定退出
+            print("  ESC 不退出程序；退出请在 3 秒内连按两次 Q")
         elif key == ord(' '):
             paused = not paused
         elif key == ord('.'):
