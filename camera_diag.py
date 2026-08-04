@@ -221,9 +221,14 @@ def preview_loop(cap, info, args):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if is_video else 0
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-    win = ("视频回放" if is_video else f"USB Camera [{info.get('backend','')}]") + \
-          " | Q退出 SPACE暂停 D检测 R框选ROI C标定 S截图"
+    # 窗口句柄名必须为纯 ASCII：Linux 的 Qt highgui 后端用非 ASCII 名建窗后，
+    # createTrackbar / selectROI 反查会失败（NULL window handler）。
+    # 中文标题改用 setWindowTitle 设置，两端都正常显示。
+    win = "camera_diag_video" if is_video else "camera_diag_camera"
+    title = ("视频回放" if is_video else f"USB Camera [{info.get('backend','')}]") + \
+            " | Q退出 SPACE暂停 D检测 R框选ROI C标定 S截图"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setWindowTitle(win, title)
     if not is_video:
         setup_trackbars(win, cap)
 

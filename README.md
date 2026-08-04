@@ -111,6 +111,7 @@ python3 notify/feishu_notifier.py --test
 | 中文叠字显示为方块 | 缺 CJK 字体 | `sudo apt install fonts-noto-cjk` |
 | `--finalize` 报未找到 ffmpeg | 未安装 ffmpeg | `sudo apt install ffmpeg`；无 sudo 时 `pip install imageio-ffmpeg` 后将其二进制软链到 PATH |
 | Wayland 下预览窗口异常 | Qt 后端不匹配 | `export QT_QPA_PLATFORM=xcb` 后重跑 |
+| `createTrackbar` 报 `NULL window handler` | 窗口句柄名含非 ASCII 字符 | Linux 的 Qt highgui 后端不支持，句柄名保持 ASCII，中文用 `cv2.setWindowTitle` 设置 |
 
 查看相机支持的格式与分辨率：
 
