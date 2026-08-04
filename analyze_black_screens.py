@@ -27,20 +27,79 @@ def ascii_work_path(path: Path, tmpdir: Path) -> Path:
         return copy
 
 
-def calibrate_screen_roi(video_path, samples=40):
-    """标定物理屏幕位置：均匀抽帧累计逐像素最大亮度。
+def _reading_order(rois):
+    """按阅读顺序（上行→下行，行内左→右）排序，使屏幕编号在多次标定间稳定。"""
+    if not rois:
+        return []
+    band = max(1, int(np.median([r[3] for r in rois]) * 0.5))
+    rows = {}
+    for r in sorted(rois, key=lambda r: r[1] + r[3] / 2):
+        cy = r[1] + r[3] / 2
+        key = next((k for k in rows if abs(k - cy) <= band), cy)
+        rows.setdefault(key, []).append(r)
+    out = []
+    for key in sorted(rows):
+        out += sorted(rows[key], key=lambda r: r[0])
+    return out
+
+
+def rois_from_maxbright(max_bright, max_screens=3, min_area_frac=0.01):
+    """由逐像素最大亮度图求屏幕 bbox 列表（支持画面内多块屏幕）。
+
+    max_screens=1 时等价于旧的单屏行为（取最大亮块）。
+    返回按阅读顺序排序的 [(x, y, w, h), ...]，标定失败返回 []。
+    """
+    h, w = max_bright.shape
+    mask = (max_bright > 90).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (23, 23))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    cands, fallback = [], []
+    for contour in contours:
+        x, y, bw, bh = cv2.boundingRect(contour)
+        area = bw * bh
+        box = (int(x), int(y), int(bw), int(bh))
+        if area >= 0.05 * w * h:
+            fallback.append((box, area))
+        if area < min_area_frac * w * h:
+            continue
+        # 排除细长的反光条/桌沿：屏幕长宽比通常在 0.4~5 之间
+        ar = bw / max(1, bh)
+        if not (0.4 <= ar <= 5.0):
+            continue
+        # 排除轮廓填充率过低的非矩形亮区
+        if cv2.contourArea(contour) < 0.45 * area:
+            continue
+        cands.append((box, area))
+
+    # 形状过滤把所有候选都滤掉时，退回旧的“最大亮块 ≥5% 画面”规则
+    if not cands:
+        cands = fallback
+    if not cands:
+        return []
+    cands.sort(key=lambda c: c[1], reverse=True)
+    # 只保留与最大屏幕面积相差不超过 15 倍的块，滤掉零星小亮点
+    biggest = cands[0][1]
+    kept = [roi for roi, area in cands[:max_screens] if area * 15 >= biggest]
+    return _reading_order(kept)
+
+
+def calibrate_screen_rois(video_path, samples=40, max_screens=3):
+    """标定物理屏幕位置：均匀抽帧累计逐像素最大亮度，返回 ROI 列表。
 
     摄像头固定时屏幕位置整段视频不变，且屏幕总有点亮的时刻，
-    最大亮度图上 >90 的最大连通区域即物理屏幕 bbox。
-    标定失败（无足够亮区）返回 None。
+    最大亮度图上 >90 的连通区域即物理屏幕 bbox；画面内有多块屏幕时
+    返回多个，按阅读顺序（上→下、左→右）编号。标定失败返回 []。
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        return None
+        return []
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     if total <= 0:
         cap.release()
-        return None
+        return []
     max_bright = None
     for i in range(samples):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(i * max(1, total - 1) / max(1, samples - 1)))
@@ -51,22 +110,14 @@ def calibrate_screen_roi(video_path, samples=40):
         max_bright = gray if max_bright is None else np.maximum(max_bright, gray)
     cap.release()
     if max_bright is None:
-        return None
-    h, w = max_bright.shape
-    mask = (max_bright > 90).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (23, 23))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best, best_area = None, 0
-    for contour in contours:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        if bw * bh > best_area:
-            best_area = bw * bh
-            best = (int(x), int(y), int(bw), int(bh))
-    if best is not None and best_area >= 0.05 * w * h:
-        return best
-    return None
+        return []
+    return rois_from_maxbright(max_bright, max_screens=max_screens)
+
+
+def calibrate_screen_roi(video_path, samples=40):
+    """单屏标定（保留旧签名）：返回面积最大的屏幕 bbox，失败返回 None。"""
+    rois = calibrate_screen_rois(video_path, samples=samples, max_screens=1)
+    return rois[0] if rois else None
 
 
 def find_bright_screen(gray):

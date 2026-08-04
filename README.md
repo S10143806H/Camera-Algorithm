@@ -70,7 +70,46 @@ python3 camera_diag.py --device 0 --detect   # 直接开 /dev/video0 并叠加�
 python3 camera_diag.py --detect --roi 64,0,896,516
 ```
 
-预览快捷键：`Q` 退出 · `SPACE` 暂停 · `D` 检测开关 · `R` 框选 ROI · `C` 自动标定 · `S` 存图。
+预览快捷键：`Q` 退出 · `SPACE` 暂停 · `D` 检测开关 · `R` 框选 ROI · `C` 自动标定 · `X` 清除 · `S` 存图。
+
+### 4. 多屏台架（画面内同时有多块屏幕）
+
+每块屏幕**独立编号、独立判定、独立事件计数与冷却**，S2 黑屏不会被 S1 的冷却窗口吞掉。
+编号按阅读顺序固定：**上→下、左→右**，与框选先后无关，可跨次复现。
+
+```bash
+python3 camera_diag.py --device 0 --detect --screens 3          # 自动标定最多 3 块屏
+python3 camera_diag.py --device 0 --detect \
+  --roi "20,60,300,200;340,40,320,220;680,70,280,190"           # 固定 3 块 ROI（分号分隔）
+python3 camera_diag.py --batch data_source --screens 3          # 批量模式同样逐屏统计
+```
+
+标定 ROI 的两种方式（预览窗口内）：
+
+| 按键 | 操作 | 适用场景 |
+|---|---|---|
+| `C` | 自动标定：按最大亮度图找出最多 `--screens` 块屏幕 | 屏幕都点亮、轮廓清晰时首选 |
+| `R` | 手动框选：拖框选中一块 → `ENTER` 确认 → 继续拖下一块 → 全部选完按 `ESC` | 自动标定漏检、或只想监控其中几块 |
+
+标定后终端会打印可直接复制的参数，例如：
+
+```
+🖥️ 自动标定出 3 块屏幕:
+   S1: (60, 180, 221, 166)
+   S2: (330, 90, 301, 226)
+   S3: (700, 160, 211, 161)
+可写入 --roi 60,180,221,166;330,90,301,226;700,160,211,161
+```
+
+**输出结构**：事件按屏幕分目录归档，`event.json` 含 `screen_no` / `screen_total` / `screen_roi`。
+
+```
+diag_captures/live_<日期>/black_screen/
+├── screen_1/CAM_<时间>_S1_001/{screenshot.jpg, event.json}
+└── screen_3/CAM_<时间>_S3_002/{screenshot.jpg, event.json}
+```
+
+> `--screens 1` 回到单屏行为。画面里只有一块屏幕时无需改动，自动标定会只返回一块。
 
 ---
 

@@ -17,10 +17,17 @@ USB2.0 摄像头诊断 + 黑屏检测预览工具
   python3 camera_diag.py --detect --roi 64,0,896,516  # 固定屏幕 ROI（推荐台架用）
   python3 camera_diag.py --batch data_source --step 3   # 批量自动检测目录内全部视频
 
+多屏台架（画面里同时有多块屏幕）:
+  每块屏幕独立编号 S1/S2/S3（阅读顺序：上→下、左→右），独立判定、
+  独立事件计数与冷却，事件按 screen_N/ 分目录归档。
+  python3 camera_diag.py --detect --screens 3          # 自动标定最多3块屏
+  python3 camera_diag.py --detect --roi 20,60,300,200;340,40,320,220;680,70,280,190
+
 预览快捷键:
   Q 退出        SPACE 暂停/继续      . 单帧步进(视频)   , 单帧步退(视频)
-  D 检测开/关   R 鼠标框选屏幕ROI    C 自动标定ROI      X 清除ROI
+  D 检测开/关   R 逐块框选多屏ROI    C 自动标定多屏ROI  X 清除ROI
   S 保存当前帧截图(diag_captures/)
+  R 用法: 拖框选中第一块屏 → ENTER 确认 → 继续拖框下一块 → 全部选完按 ESC
 
 黑屏检测重要相机参数（按影响排序）:
   1. AutoExposure=0(手动) —— 屏幕变黑时自动曝光会拉亮整个画面，
@@ -57,6 +64,8 @@ try:
         detect_dark_region,
         draw_annotation,
         calibrate_screen_roi,
+        calibrate_screen_rois,
+        rois_from_maxbright,
     )
     HAVE_DETECTOR = True
 except ImportError:
@@ -72,23 +81,39 @@ def run_detect(frame, roi):
         return detect_dark_region(frame)
 
 
+def run_detect_multi(frame, rois):
+    """对每块屏幕独立检测。rois 为空时退化为整幅画面单次检测。
+
+    返回 [(screen_no, roi, result), ...]，screen_no 从 1 起，整幅画面时为 0。
+    """
+    if not rois:
+        return [(0, None, run_detect(frame, None))]
+    return [(i + 1, roi, run_detect(frame, roi)) for i, roi in enumerate(rois)]
+
+
+def parse_rois(text):
+    """解析 --roi：单屏 'x,y,w,h'，多屏用分号分隔 'x,y,w,h;x,y,w,h'。"""
+    rois = []
+    for chunk in str(text).split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [int(v) for v in chunk.split(",")]
+        if len(parts) != 4:
+            raise ValueError(f"ROI 需为 x,y,w,h 四个整数: {chunk!r}")
+        rois.append(tuple(parts))
+    return rois
+
+
+def format_rois(rois):
+    """反向格式化，便于直接抄进 --roi 参数。"""
+    return ";".join(",".join(str(int(v)) for v in r) for r in rois)
+
+
 def roi_from_maxbright(max_bright):
-    """由逐像素最大亮度图求屏幕 bbox（与 calibrate_screen_roi 同规则）。"""
-    h, w = max_bright.shape
-    mask = (max_bright > 90).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (23, 23))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best, best_area = None, 0
-    for contour in contours:
-        x, y, bw, bh = cv2.boundingRect(contour)
-        if bw * bh > best_area:
-            best_area = bw * bh
-            best = (int(x), int(y), int(bw), int(bh))
-    if best is not None and best_area >= 0.05 * w * h:
-        return best
-    return None
+    """由逐像素最大亮度图求单块屏幕 bbox（保留旧签名）。"""
+    rois = rois_from_maxbright(max_bright, max_screens=1)
+    return rois[0] if rois else None
 
 
 # ---------------------------------------------------------------- 相机参数
@@ -209,14 +234,18 @@ def preview_loop(cap, info, args):
     if args.detect and not HAVE_DETECTOR:
         print("  ⚠️ 未找到 analyze_black_screens.py，检测功能不可用")
 
-    screen_roi = None
+    max_screens = max(1, getattr(args, "screens", 3) or 3)
+    screen_rois = []
     if args.roi:
-        screen_roi = tuple(int(v) for v in args.roi.split(","))
-        print(f"  🖥️ 使用固定屏幕ROI: {screen_roi}")
+        screen_rois = parse_rois(args.roi)
+        print(f"  🖥️ 使用固定屏幕ROI ({len(screen_rois)} 块): {format_rois(screen_rois)}")
     elif is_video and HAVE_DETECTOR:
-        print("  🖥️ 视频模式自动标定屏幕ROI ...")
-        screen_roi = calibrate_screen_roi(args.video)
-        print(f"     标定结果: {screen_roi}")
+        print(f"  🖥️ 视频模式自动标定屏幕ROI (最多 {max_screens} 块) ...")
+        screen_rois = calibrate_screen_rois(args.video, max_screens=max_screens)
+        for i, r in enumerate(screen_rois, 1):
+            print(f"     S{i}: {r}")
+        if not screen_rois:
+            print("     标定失败，按整幅画面检测")
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if is_video else 0
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -226,7 +255,7 @@ def preview_loop(cap, info, args):
     # 中文标题改用 setWindowTitle 设置，两端都正常显示。
     win = "camera_diag_video" if is_video else "camera_diag_camera"
     title = ("视频回放" if is_video else f"USB Camera [{info.get('backend','')}]") + \
-            " | Q退出 SPACE暂停 D检测 R框选ROI C标定 S截图"
+            " | Q退出 SPACE暂停 D检测 R框选多屏ROI C自动标定 X清除 S截图"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setWindowTitle(win, title)
     if not is_video:
@@ -249,14 +278,20 @@ def preview_loop(cap, info, args):
             print("  📨 飞书告警: 开 (FEISHU_WEBHOOK)")
         except Exception as e:
             print(f"  ⚠️ 飞书告警不可用: {e}")
-    streak, cooldown_until, event_seq = 0, 0.0, 0
+    event_seq = 0
     EVIDENCE_N = max(3, getattr(args, "evidence_n", 10) or 10)
     EVIDENCE_MIN = 3
     EVIDENCE_GAP = 0.4        # 证据帧最小间隔(秒)，去掉重复相似帧
-    evidence = []
-    last_evi_t = -1e9         # 上一条证据的时间(视频秒或墙钟秒)
+    # 每块屏幕独立计数：S2 黑屏不应被 S1 的冷却窗口吞掉
+    screen_state = {}
+
+    def state_of(no):
+        return screen_state.setdefault(
+            no, {"streak": 0, "cooldown_until": 0.0, "evidence": [], "last_evi_t": -1e9})
+
     event_root = save_dir / f"live_{datetime.now().strftime('%Y%m%d')}" / "black_screen"
-    source_name = Path(args.video).name if is_video else f"camera_{info.get('idx', '?')}" 
+    source_name = Path(args.video).name if is_video else f"camera_{info.get('idx', '?')}"
+    results = []              # [(screen_no, roi, result), ...]
 
     while True:
         advance = (not paused) or step != 0
@@ -284,48 +319,54 @@ def preview_loop(cap, info, args):
             calib_buf.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
             last_calib_sample = time.time()
 
-        # ---- 检测 ----
+        # ---- 检测（逐屏独立） ----
         if detect_on and advance:
-            result = run_detect(frame, screen_roi)
+            results = run_detect_multi(frame, screen_rois)
             now_wc = datetime.now()
             vt = (cap.get(cv2.CAP_PROP_POS_FRAMES) / fps) if is_video else None
             fi = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) if is_video else None
             ts_text = (_fmt_ts(vt) if is_video
                        else now_wc.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])
             cur_t = vt if is_video else time.time()
-            if result["abnormal"]:
-                streak += 1
-                if time.time() >= cooldown_until and cur_t - last_evi_t >= EVIDENCE_GAP:
-                    evidence.append((frame.copy(), result, ts_text, vt, fi, now_wc))
-                    last_evi_t = cur_t
-                    if len(evidence) >= EVIDENCE_N:
+            for no, roi, result in results:
+                st = state_of(no)
+                if result["abnormal"]:
+                    st["streak"] += 1
+                    if (time.time() >= st["cooldown_until"]
+                            and cur_t - st["last_evi_t"] >= EVIDENCE_GAP):
+                        st["evidence"].append((frame.copy(), result, ts_text, vt, fi, now_wc))
+                        st["last_evi_t"] = cur_t
+                        if len(st["evidence"]) >= EVIDENCE_N:
+                            event_seq += 1
+                            threading.Thread(
+                                target=emit_merged_event,
+                                args=(st["evidence"], source_name, event_root, event_seq),
+                                kwargs={"notifier": notifier, "screen_no": no,
+                                        "screen_roi": roi, "screen_total": len(results)},
+                                daemon=True).start()
+                            st["evidence"] = []
+                            st["cooldown_until"] = time.time() + 10.0
+                else:
+                    if (len(st["evidence"]) >= EVIDENCE_MIN
+                            and time.time() >= st["cooldown_until"]):
                         event_seq += 1
                         threading.Thread(
                             target=emit_merged_event,
-                            args=(evidence, source_name, event_root, event_seq),
-                            kwargs={"notifier": notifier}, daemon=True).start()
-                        evidence = []
-                        cooldown_until = time.time() + 10.0
-            else:
-                if len(evidence) >= EVIDENCE_MIN and time.time() >= cooldown_until:
-                    event_seq += 1
-                    threading.Thread(
-                        target=emit_merged_event,
-                        args=(evidence, source_name, event_root, event_seq),
-                        kwargs={"notifier": notifier}, daemon=True).start()
-                    cooldown_until = time.time() + 10.0
-                evidence = []
-                streak = 0
+                            args=(st["evidence"], source_name, event_root, event_seq),
+                            kwargs={"notifier": notifier, "screen_no": no,
+                                    "screen_roi": roi, "screen_total": len(results)},
+                            daemon=True).start()
+                        st["cooldown_until"] = time.time() + 10.0
+                    st["evidence"] = []
+                    st["streak"] = 0
 
-        if detect_on and result is not None:
+        if detect_on and results:
             ts_disp = (_fmt_ts(cap.get(cv2.CAP_PROP_POS_FRAMES) / fps) if is_video
                        else datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3])
-            display = annotate_live(frame, result, ts_disp)
+            display = annotate_live_multi(frame, results, ts_disp)
         else:
             display = frame.copy()
-            if screen_roi:
-                rx, ry, rw, rh = screen_roi
-                cv2.rectangle(display, (rx, ry), (rx + rw, ry + rh), (255, 160, 0), 2)
+            draw_screen_boxes(display, screen_rois)
 
         # ---- 状态栏 ----
         gray_mean = frame.mean()
@@ -335,7 +376,10 @@ def preview_loop(cap, info, args):
         else:
             status = f"{info.get('w','?')}x{info.get('h','?')} {info.get('backend','')}"
         status += f"  mean={gray_mean:.0f}  detect={'ON' if detect_on else 'off'}"
-        status += f"  ROI={'set' if screen_roi else 'none'}"
+        status += f"  screens={len(screen_rois) if screen_rois else 'full-frame'}"
+        if detect_on and results:
+            bad = [f"S{no}" for no, _, r in results if r["abnormal"] and no]
+            status += f"  ALERT={','.join(bad)}" if bad else "  ALERT=-"
         if paused:
             status += "  [PAUSED]"
         cv2.putText(display, status, (10, display.shape[0] - 12),
@@ -357,22 +401,39 @@ def preview_loop(cap, info, args):
                 detect_on = not detect_on
                 print(f"  检测 -> {'开' if detect_on else '关'}")
         elif key in (ord('r'), ord('R')):
-            sel = cv2.selectROI(win, frame, showCrosshair=True)
-            if sel[2] > 10 and sel[3] > 10:
-                screen_roi = tuple(int(v) for v in sel)
-                print(f"  🖥️ 手动ROI = {screen_roi}  (可写入 --roi {','.join(map(str,screen_roi))})")
+            # 多屏框选：逐块拖框后回车确认下一块，ESC 结束
+            print(f"  🖥️ 框选每块屏幕：拖框后按 ENTER 确认下一块，全部选完按 ESC "
+                  f"(最多 {max_screens} 块)")
+            sels = cv2.selectROIs(win, frame, showCrosshair=True)
+            picked = [tuple(int(v) for v in s) for s in sels if s[2] > 10 and s[3] > 10]
+            if picked:
+                screen_rois = order_rois(picked)[:max_screens]
+                screen_state.clear(); results = []
+                for i, r in enumerate(screen_rois, 1):
+                    print(f"     S{i}: {r}")
+                print(f"  可写入 --roi {format_rois(screen_rois)}")
+            else:
+                print("  未选中任何区域，ROI 保持不变")
         elif key in (ord('c'), ord('C')):
             if is_video and HAVE_DETECTOR:
-                screen_roi = calibrate_screen_roi(args.video)
+                screen_rois = calibrate_screen_rois(args.video, max_screens=max_screens)
             elif calib_buf:
                 mb = calib_buf[0].copy()
                 for g in calib_buf:
                     mb = np.maximum(mb, g)
-                screen_roi = roi_from_maxbright(mb)
-            print(f"  🖥️ 自动标定ROI = {screen_roi}")
+                screen_rois = rois_from_maxbright(mb, max_screens=max_screens)
+            screen_state.clear(); results = []
+            if screen_rois:
+                print(f"  🖥️ 自动标定出 {len(screen_rois)} 块屏幕:")
+                for i, r in enumerate(screen_rois, 1):
+                    print(f"     S{i}: {r}")
+                print(f"  可写入 --roi {format_rois(screen_rois)}")
+            else:
+                print("  🖥️ 自动标定失败：屏幕未点亮或亮区过小，改用 R 手动框选")
         elif key in (ord('x'), ord('X')):
-            screen_roi = None
-            print("  ROI 已清除")
+            screen_rois = []
+            screen_state.clear(); results = []
+            print("  ROI 已清除，回到整幅画面检测")
         elif key in (ord('s'), ord('S')):
             save_dir.mkdir(exist_ok=True)
             p = save_dir / f"cap_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
@@ -386,45 +447,110 @@ def preview_loop(cap, info, args):
 
 
 
-def annotate_live(frame, result, ts_text):
-    """实时/回放标注：红框 + 检测文字，左下角为真实时间戳(取代读秒)。"""
+def order_rois(rois):
+    """按阅读顺序排序，使屏幕编号 S1/S2/S3 与框选先后无关、可复现。"""
+    if HAVE_DETECTOR:
+        from analyze_black_screens import _reading_order
+        return _reading_order(list(rois))
+    return sorted(rois, key=lambda r: (r[1], r[0]))
+
+
+def _put_text_clamped(img, text, x, y, scale, color, thick=2):
+    """在图上写字并把起点夹回画面内，避免长标签被右/上边缘截断。"""
+    (tw, th_), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    x = int(min(max(12, x), max(12, img.shape[1] - tw - 12)))
+    y = int(min(max(th_ + 8, y), img.shape[0] - 8))
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def draw_screen_boxes(img, numbered_rois, active=None):
+    """画每块屏幕的标定框 + 编号。
+
+    numbered_rois: [(screen_no, roi), ...] —— 编号由调用方给定，
+    不能按列表下标重排，否则单屏事件图会把 S3 画成 S1。
+    active: 异常屏幕编号集合（画红色）。
+    """
+    active = active or set()
+    for no, roi in numbered_rois:
+        rx, ry, rw, rh = roi
+        bad = no in active
+        color = (0, 0, 255) if bad else (255, 160, 0)
+        cv2.rectangle(img, (rx, ry), (rx + rw, ry + rh), color, 3 if bad else 2)
+        label = f"S{no}" + (" BLACK" if bad else "")
+        (tw, th_), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        lx = int(min(rx, img.shape[1] - tw - 12))
+        ly = ry + th_ + 6 if ry < th_ + 8 else ry - 6
+        cv2.rectangle(img, (lx, ly - th_ - 4), (lx + tw + 8, ly + 4), color, -1)
+        cv2.putText(img, label, (lx + 4, ly), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return img
+
+
+def annotate_live_multi(frame, results, ts_text, summary=True):
+    """多屏标注：每块屏幕独立编号与判定，异常屏幕红框高亮，正常屏幕橙框。
+
+    results: [(screen_no, roi, result), ...]；screen_no==0 表示整幅画面模式。
+    summary=False 供批量模式使用（那边自己写多行事件抬头，避免文字叠字）。
+    """
     annotated = frame.copy()
-    if result.get("screen_roi"):
-        rx, ry, rw, rh = result["screen_roi"]
-        cv2.rectangle(annotated, (rx, ry), (rx + rw, ry + rh), (255, 160, 0), 2)
-    if result["abnormal"] and result["region"]:
+    overlay = None
+    for no, roi, result in results:
+        if not (result["abnormal"] and result["region"]):
+            continue
         x, y, w_, h_ = result["region"]["bbox"]
-        overlay = annotated.copy()
+        if overlay is None:
+            overlay = annotated.copy()
         cv2.rectangle(overlay, (x, y), (x + w_, y + h_), (0, 0, 255), -1)
+    if overlay is not None:
         annotated = cv2.addWeighted(overlay, 0.22, annotated, 0.78, 0)
+
+    bad = set()
+    for no, roi, result in results:
+        if not (result["abnormal"] and result["region"]):
+            continue
+        bad.add(no)
+        x, y, w_, h_ = result["region"]["bbox"]
         cv2.rectangle(annotated, (x, y), (x + w_, y + h_), (0, 0, 255), 5)
-        cv2.putText(annotated,
-                    f"BLACK SCREEN DETECTED  region_dark={result['region']['dark_pct']:.1f}%",
-                    (max(12, x), max(34, y - 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-    else:
-        cv2.putText(annotated, "normal/dim screen", (12, 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 180, 0), 2, cv2.LINE_AA)
-    cv2.putText(annotated, ts_text, (12, annotated.shape[0] - 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 2, cv2.LINE_AA)
+        tag = f"S{no} " if no else ""
+        _put_text_clamped(annotated, f"{tag}BLACK  dark={result['region']['dark_pct']:.0f}%",
+                          x, y - 12, 0.65, (0, 0, 255))
+
+    numbered = [(no, roi) for no, roi, _ in results if roi]
+    if numbered:
+        draw_screen_boxes(annotated, numbered, active=bad)
+    if summary:
+        text = ("  ".join(f"S{no}:{'BLACK' if no in bad else 'ok'}" for no, _, _ in results)
+                if numbered else ("BLACK SCREEN" if bad else "normal/dim screen"))
+        _put_text_clamped(annotated, text, 12, 34, 0.8,
+                          (0, 0, 255) if bad else (0, 180, 0))
+    _put_text_clamped(annotated, ts_text, 12, annotated.shape[0] - 40, 0.7, (0, 215, 255))
     return annotated
 
 
-def emit_merged_event(evidence, source_name, out_root, seq, notifier=None):
+def annotate_live(frame, result, ts_text):
+    """单屏标注（保留旧签名，供合并证据图逐帧复用）。"""
+    return annotate_live_multi(frame, [(0, result.get("screen_roi"), result)], ts_text)
+
+
+def emit_merged_event(evidence, source_name, out_root, seq, notifier=None,
+                      screen_no=0, screen_roi=None, screen_total=1):
     """把缓存的多帧证据合并成一次完整事件：拼图 + event.json + 飞书(带图)。
 
     evidence: [(frame, result, ts_text, video_time_s, frame_index, wallclock), ...]
+    screen_no: 屏幕编号(1 起)，0 表示整幅画面模式；事件按屏幕分目录归档。
     """
     import json as _json
     now = datetime.now()
-    eid = f"CAM_{now.strftime('%Y%m%d_%H%M%S')}_{seq:03d}"
-    ev_dir = out_root / eid
+    tag = f"_S{screen_no}" if screen_no else ""
+    eid = f"CAM_{now.strftime('%Y%m%d_%H%M%S')}{tag}_{seq:03d}"
+    ev_dir = out_root / (f"screen_{screen_no}" if screen_no else "full_frame") / eid
     ev_dir.mkdir(parents=True, exist_ok=True)
 
     # 逐帧标注 -> 缩略 -> 拼图 (5列)
     thumbs = []
     for frame, result, ts_text, vt, fi, wc in evidence:
-        ann = annotate_live(frame, result, ts_text)
+        # 带上真实屏幕编号，否则缩略图里会统一标成 S0
+        ann = annotate_live_multi(frame, [(screen_no, screen_roi, result)], ts_text)
         thumbs.append(cv2.resize(ann, (384, 216), interpolation=cv2.INTER_AREA))
     cols = 5 if len(thumbs) <= 10 else 8
     tw, th_ = (384, 216) if cols == 5 else (240, 135)
@@ -441,7 +567,8 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None):
     t0, t1 = evidence[0], evidence[-1]
     span = (f"video {_fmt_ts(t0[3])} ~ {_fmt_ts(t1[3])}" if t0[3] is not None
             else f"{t0[5].strftime('%H:%M:%S.%f')[:-3]} ~ {t1[5].strftime('%H:%M:%S.%f')[:-3]}")
-    head_lines = [f"BLACK SCREEN - MERGED EVIDENCE ({len(evidence)} frames)",
+    scr = f"SCREEN {screen_no}/{screen_total} - " if screen_no else ""
+    head_lines = [f"{scr}BLACK SCREEN - MERGED EVIDENCE ({len(evidence)} frames)",
                   f"Source: {source_name[:60]}   Span: {span}   Score: {score}"]
     for li, txt in enumerate(head_lines):
         cv2.putText(sheet, txt, (14, 36 + 34 * li), cv2.FONT_HERSHEY_SIMPLEX,
@@ -453,6 +580,9 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None):
         "event_id": eid,
         "event_type": "black_screen",
         "source": source_name,
+        "screen_no": screen_no or None,
+        "screen_total": screen_total,
+        "screen_roi": list(screen_roi) if screen_roi else None,
         "frame_count": len(evidence),
         "frame_index": t0[4],
         "frame_index_end": t1[4],
@@ -466,8 +596,8 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None):
     }
     (ev_dir / "event.json").write_text(_json.dumps(event, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
-    print(f"  🚨 BLACK_SCREEN event ({len(evidence)} frames merged) span={span} "
-          f"score={score} -> {eid}")
+    print(f"  🚨 {'S' + str(screen_no) + ' ' if screen_no else ''}BLACK_SCREEN event "
+          f"({len(evidence)} frames merged) span={span} score={score} -> {eid}")
     if notifier:
         try:
             notifier(event, image_path=str(shot))
@@ -531,20 +661,29 @@ def _fmt_ts(seconds):
 
 
 def batch_detect_video(video_path, out_root, step=1, hit_frames=3, cooldown_s=10.0,
-                       notifier=None):
+                       notifier=None, max_screens=3, fixed_rois=None):
     """对单个视频自动运行黑屏检测：连续 hit_frames 个采样命中 → 生成事件，
-    进入 cooldown_s 冷却；每个事件保存标注截图 + event.json。"""
+    进入 cooldown_s 冷却；每块屏幕独立计数与冷却，事件按屏幕分目录归档。"""
     video_path = Path(video_path)
     print(f"\n▶ {video_path.name}")
-    roi = calibrate_screen_roi(str(video_path)) if HAVE_DETECTOR else None
-    print(f"  屏幕ROI: {roi}")
+    if fixed_rois:
+        rois = list(fixed_rois)
+    else:
+        rois = calibrate_screen_rois(str(video_path), max_screens=max_screens) \
+            if HAVE_DETECTOR else []
+    if rois:
+        print(f"  屏幕ROI ({len(rois)} 块): " +
+              "  ".join(f"S{i}={r}" for i, r in enumerate(rois, 1)))
+    else:
+        print("  屏幕ROI: 未标定，按整幅画面检测")
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print("  ❌ 无法打开"); return []
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    events, streak, cooldown_until, idx = [], 0, -1.0, 0
+    events, idx = [], 0
+    per_screen = {}           # 每块屏幕独立的 streak / cooldown
     import json as _json
     while True:
         ok, frame = cap.read()
@@ -552,56 +691,75 @@ def batch_detect_video(video_path, out_root, step=1, hit_frames=3, cooldown_s=10
             break
         if idx % step == 0:
             t = idx / fps
-            r = run_detect(frame, roi)
-            if r["abnormal"]:
-                streak += 1
-                if streak >= hit_frames and t >= cooldown_until:
-                    eid = f"{video_path.stem[:22]}_{len(events)+1:03d}"
-                    ev_dir = out_root / video_path.stem[:40] / eid
-                    ev_dir.mkdir(parents=True, exist_ok=True)
-                    ann = draw_annotation(frame, r, t)
-                    now = datetime.now()
-                    lines = ["BLACK SCREEN",
-                             f"Source: {video_path.name[:44]}",
-                             f"Video Time: {_fmt_ts(t)}",
-                             f"Capture Time: {now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}",
-                             f"Frame: {idx}",
-                             f"Score: {min(1.0, r['region']['dark_pct']/100.0):.3f}"]
-                    y0 = 60
-                    for li, txt in enumerate(lines):
-                        cv2.putText(ann, txt, (12, y0 + 26*li), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.62, (0, 0, 255), 2, cv2.LINE_AA)
-                    shot = ev_dir / "screenshot.jpg"
-                    cv2.imwrite(str(shot), ann)
-                    event = {
-                        "event_id": eid,
-                        "event_type": "black_screen",
-                        "source": video_path.name,
-                        "frame_index": idx,
-                        "source_timestamp_ms": int(round(t * 1000)),
-                        "capture_time": now.astimezone().isoformat(timespec="milliseconds"),
-                        "score": round(min(1.0, r["region"]["dark_pct"] / 100.0), 3),
-                        "bbox": r["region"]["bbox"],
-                        "screen_roi": list(roi) if roi else None,
-                        "screenshot": str(shot),
-                    }
-                    (ev_dir / "event.json").write_text(
-                        _json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
-                    events.append(event)
-                    if notifier:
-                        try:
-                            notifier(event)
-                            print("  📨 飞书告警已发送")
-                        except Exception as e:
-                            print(f"  ⚠️ 飞书告警失败: {e}")
-                    cooldown_until = t + cooldown_s
-                    print(f"  🚨 BLACK_SCREEN detected video_timestamp={_fmt_ts(t)} "
-                          f"frame={idx} score={event['score']} -> {ev_dir.name}")
-            else:
-                streak = 0
+            dets = run_detect_multi(frame, rois)
+            for no, roi, r in dets:
+                st = per_screen.setdefault(no, {"streak": 0, "cooldown_until": -1.0})
+                if not r["abnormal"]:
+                    st["streak"] = 0
+                    continue
+                st["streak"] += 1
+                if st["streak"] < hit_frames or t < st["cooldown_until"]:
+                    continue
+                tag = f"_S{no}" if no else ""
+                eid = f"{video_path.stem[:22]}{tag}_{len(events)+1:03d}"
+                ev_dir = (out_root / video_path.stem[:40] /
+                          (f"screen_{no}" if no else "full_frame") / eid)
+                ev_dir.mkdir(parents=True, exist_ok=True)
+                # 用全部屏幕的检测结果标注：编号才是真实编号，且保留其他屏幕作对照
+                ann = annotate_live_multi(frame, dets, _fmt_ts(t), summary=False)
+                now = datetime.now()
+                # 抬头压缩到 3 行：行数越少，越不容易盖住画面里的屏幕
+                lines = [f"{'SCREEN ' + str(no) + ' - ' if no else ''}BLACK SCREEN"
+                         f"   Score: {min(1.0, r['region']['dark_pct']/100.0):.3f}",
+                         f"Source: {video_path.name[:44]}"
+                         f"   Frame: {idx}   Video Time: {_fmt_ts(t)}",
+                         f"Capture: {now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"]
+                y0 = 40
+                # 抬头压半透明底板，避免文字与屏幕画面叠在一起看不清
+                pw = max(cv2.getTextSize(t_, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)[0][0]
+                         for t_ in lines) + 24
+                panel = ann.copy()
+                cv2.rectangle(panel, (0, 0), (pw, y0 + 26 * len(lines)), (0, 0, 0), -1)
+                ann = cv2.addWeighted(panel, 0.55, ann, 0.45, 0)
+                for li, txt in enumerate(lines):
+                    cv2.putText(ann, txt, (12, y0 + 26*li), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.62, (0, 0, 255), 2, cv2.LINE_AA)
+                shot = ev_dir / "screenshot.jpg"
+                cv2.imwrite(str(shot), ann)
+                event = {
+                    "event_id": eid,
+                    "event_type": "black_screen",
+                    "source": video_path.name,
+                    "screen_no": no or None,
+                    "screen_total": max(1, len(rois)),
+                    "frame_index": idx,
+                    "source_timestamp_ms": int(round(t * 1000)),
+                    "capture_time": now.astimezone().isoformat(timespec="milliseconds"),
+                    "score": round(min(1.0, r["region"]["dark_pct"] / 100.0), 3),
+                    "bbox": r["region"]["bbox"],
+                    "screen_roi": list(roi) if roi else None,
+                    "screenshot": str(shot),
+                }
+                (ev_dir / "event.json").write_text(
+                    _json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+                events.append(event)
+                if notifier:
+                    try:
+                        notifier(event)
+                        print("  📨 飞书告警已发送")
+                    except Exception as e:
+                        print(f"  ⚠️ 飞书告警失败: {e}")
+                st["cooldown_until"] = t + cooldown_s
+                print(f"  🚨 {'S' + str(no) + ' ' if no else ''}BLACK_SCREEN detected "
+                      f"video_timestamp={_fmt_ts(t)} frame={idx} "
+                      f"score={event['score']} -> {ev_dir.name}")
         idx += 1
     cap.release()
-    print(f"  完成: {idx}/{total} 帧, 事件数={len(events)}")
+    by_screen = {}
+    for e in events:
+        by_screen[e["screen_no"] or 0] = by_screen.get(e["screen_no"] or 0, 0) + 1
+    detail = "  ".join(f"S{k or '-'}={v}" for k, v in sorted(by_screen.items()))
+    print(f"  完成: {idx}/{total} 帧, 事件数={len(events)}" + (f"  ({detail})" if detail else ""))
     return events
 
 
@@ -622,10 +780,14 @@ def run_batch(args):
             print("📨 飞书告警: 开 (FEISHU_WEBHOOK)")
         except Exception as e:
             print(f"⚠️ 飞书告警不可用: {e}")
-    print(f"批量检测 {len(videos)} 个视频, 采样步长={args.step}, 输出: {out_root}")
+    max_screens = max(1, getattr(args, "screens", 3) or 3)
+    fixed_rois = parse_rois(args.roi) if args.roi else None
+    print(f"批量检测 {len(videos)} 个视频, 采样步长={args.step}, "
+          f"最多 {max_screens} 块屏幕, 输出: {out_root}")
     all_events = []
     for v in videos:
-        all_events += batch_detect_video(v, out_root, step=args.step, notifier=notifier)
+        all_events += batch_detect_video(v, out_root, step=args.step, notifier=notifier,
+                                         max_screens=max_screens, fixed_rois=fixed_rois)
     import json as _json
     (out_root / "events_summary.json").write_text(
         _json.dumps(all_events, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -638,7 +800,11 @@ def main():
     parser.add_argument("--video", help="播放视频文件而非相机（手动复核问题单视频）")
     parser.add_argument("--device", type=int, default=None, help="跳过诊断直接打开指定相机 index")
     parser.add_argument("--detect", action="store_true", help="开启黑屏检测红框叠加")
-    parser.add_argument("--roi", help="固定屏幕ROI: x,y,w,h（台架机位固定后推荐）")
+    parser.add_argument("--roi",
+                        help="固定屏幕ROI: 单屏 x,y,w,h；多屏用分号分隔 "
+                             "x,y,w,h;x,y,w,h;x,y,w,h（台架机位固定后推荐）")
+    parser.add_argument("--screens", type=int, default=3,
+                        help="画面内最多识别几块屏幕（默认3，设1为旧的单屏行为）")
     parser.add_argument("--batch", help="批量自动检测：目录或单个视频文件（无GUI）")
     parser.add_argument("--step", type=int, default=1, help="批量模式采样步长（每N帧检测1帧）")
     parser.add_argument("--out", help="批量模式输出目录（默认 diag_captures/batch_日期/black_screen）")
