@@ -22,7 +22,13 @@
   @media(max-width:1000px){main{grid-template-columns:1fr}}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .card h2{font-size:13px;margin:0;padding:10px 14px;border-bottom:1px solid var(--line);
-           color:var(--dim);font-weight:600;letter-spacing:.04em}
+           color:var(--dim);font-weight:600;letter-spacing:.04em;
+           display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+  .card h2:hover{color:var(--fg)}
+  .card h2 .chev{margin-left:auto;transition:transform .15s;font-size:11px;opacity:.8}
+  .card.collapsed h2{border-bottom:none}
+  .card.collapsed h2 .chev{transform:rotate(-90deg)}
+  .card.collapsed .fold{display:none}
   .card .body{padding:14px}
   #stage{position:relative;line-height:0;background:#000}
   #stage img{width:100%;height:auto;display:block}
@@ -47,7 +53,18 @@
   .sn.bad{background:var(--bad);color:#fff}
   .sn.ok{background:rgba(46,204,113,.18);color:var(--ok)}
   #events{max-height:340px;overflow:auto}
-  #events img{width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--line)}
+  #events img{width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--line);
+              cursor:zoom-in;transition:border-color .15s}
+  #events img:hover{border-color:var(--accent)}
+  /* 证据截图点开看大图 */
+  #lightbox{position:fixed;inset:0;z-index:50;background:rgba(6,8,12,.92);
+            display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:20px}
+  #lightbox[hidden]{display:none}
+  #lightbox img{max-width:100%;max-height:calc(100vh - 110px);object-fit:contain;
+                border-radius:8px;border:1px solid var(--line);background:#000;cursor:zoom-out}
+  #lb-bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;
+          color:var(--dim);font-size:12px}
+  #lb-bar b{color:var(--fg)}
   .ev{padding:10px 14px;border-bottom:1px solid var(--line)}
   .ev .t{color:var(--dim);font-size:11px}
   code{background:#232a36;padding:2px 6px;border-radius:5px;font-size:11.5px;
@@ -66,50 +83,68 @@
 
 <main>
   <div>
-    <div class="card">
-      <h2>实时画面</h2>
-      <div id="stage">
-        <img id="video" src="/stream" alt="live">
-        <canvas id="overlay"></canvas>
-      </div>
-      <div class="toolbar">
-        <button class="primary" id="btn-select">框选 ROI</button>
-        <button id="btn-calib">自动标定</button>
-        <button id="btn-apply" disabled>应用</button>
-        <button id="btn-undo" disabled>撤销上一块</button>
-        <button id="btn-cancel" disabled>取消</button>
-        <button class="danger" id="btn-clear">清除 ROI</button>
-        <button id="btn-detect">检测开关</button>
-      </div>
-      <div class="hint" id="hint">
-        点「框选 ROI」后在画面上拖框，每拖一次添加一块屏幕，点「应用」生效。
+    <div class="card" data-key="live">
+      <h2>实时画面<span class="chev">▾</span></h2>
+      <div class="fold">
+        <div id="stage">
+          <img id="video" src="/stream" alt="live">
+          <canvas id="overlay"></canvas>
+        </div>
+        <div class="toolbar">
+          <button class="primary" id="btn-select">框选 ROI</button>
+          <button id="btn-calib">自动标定</button>
+          <button id="btn-apply" disabled>应用</button>
+          <button id="btn-undo" disabled>撤销上一块</button>
+          <button id="btn-cancel" disabled>取消</button>
+          <button class="danger" id="btn-clear">清除 ROI</button>
+          <button id="btn-detect">检测开关</button>
+        </div>
+        <div class="hint" id="hint">
+          点「框选 ROI」后在画面上拖框，每拖一次添加一块屏幕，点「应用」生效。
+        </div>
       </div>
     </div>
   </div>
 
   <div>
-    <div class="card" style="margin-bottom:16px">
-      <h2>屏幕状态</h2>
-      <div class="body" style="padding:0">
-        <table id="screens"><tbody><tr><td class="empty">未标定 ROI，按整幅画面检测</td></tr></tbody></table>
-      </div>
-      <div class="hint" style="padding:10px 14px">
-        <div id="roi-arg"></div>
+    <div class="card" data-key="screens" style="margin-bottom:16px">
+      <h2>屏幕状态<span class="chev">▾</span></h2>
+      <div class="fold">
+        <div class="body" style="padding:0">
+          <table id="screens"><tbody><tr><td class="empty">未标定 ROI，按整幅画面检测</td></tr></tbody></table>
+        </div>
+        <div class="hint" style="padding:10px 14px">
+          <div id="roi-arg"></div>
+        </div>
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:16px">
-      <h2>相机参数</h2>
-      <div class="body" id="params"><div class="empty">加载中…</div></div>
-      <div class="hint">黑屏检测建议：AutoExp 设 0（手动）后固定 Exposure，Gain 调低。</div>
+    <div class="card" data-key="params" style="margin-bottom:16px">
+      <h2>相机参数<span class="chev">▾</span></h2>
+      <div class="fold">
+        <div class="body" id="params"><div class="empty">加载中…</div></div>
+        <div class="hint">黑屏检测建议：AutoExp 设 0（手动）后固定 Exposure，Gain 调低。</div>
+      </div>
     </div>
 
-    <div class="card">
-      <h2>事件 <span id="ev-count" class="pill">0</span></h2>
-      <div id="events"><div class="empty">暂无事件</div></div>
+    <div class="card" data-key="events">
+      <h2>事件 <span id="ev-count" class="pill">0</span><span class="chev">▾</span></h2>
+      <div class="fold">
+        <div id="events"><div class="empty">暂无事件</div></div>
+      </div>
     </div>
   </div>
 </main>
+
+<div id="lightbox" hidden>
+  <img id="lb-img" alt="证据截图">
+  <div id="lb-bar">
+    <b id="lb-title"></b>
+    <span id="lb-meta"></span>
+    <button id="lb-open">新标签页打开原图</button>
+    <button id="lb-close">关闭 (ESC)</button>
+  </div>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -270,19 +305,68 @@ async function poll(){
 async function pollEvents(){
   let evs;
   try { evs = (await api('/api/events?limit=20')).events; } catch { return; }
-  $('#events').innerHTML = evs.length ? evs.map(e => `
-    <div class="ev">
+  $('#events').innerHTML = evs.length ? evs.map(e => {
+    const when = (e.capture_time || '').replace('T', ' ').slice(0, 23);
+    const meta = `score ${e.score} · ${e.frame_count} 帧 · ${when}`;
+    return `
+    <div class="ev" data-title="S${e.screen_no || '全'} BLACK SCREEN" data-meta="${meta}">
       <div><span class="sn bad">S${e.screen_no || '全'}</span>
            <b style="color:var(--bad)">BLACK SCREEN</b>
            <span class="t">score ${e.score} · ${e.frame_count} 帧</span></div>
-      <div class="t">${(e.capture_time || '').replace('T', ' ').slice(0, 23)}</div>
-      <img loading="lazy" src="/api/events/${e.event_id}/screenshot">
-    </div>`).join('') : '<div class="empty">暂无事件</div>';
+      <div class="t">${when}</div>
+      <img loading="lazy" title="点击查看大图" src="/api/events/${e.event_id}/screenshot">
+    </div>`;
+  }).join('') : '<div class="empty">暂无事件</div>';
 }
+
+/* ---------- 面板折叠（状态存 localStorage，刷新后保持） ---------- */
+const FOLD_KEY = 'cam.folded';
+function foldedSet(){
+  try { return new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || '[]')); }
+  catch { return new Set(); }
+}
+function initFolding(){
+  const folded = foldedSet();
+  document.querySelectorAll('.card[data-key]').forEach(card => {
+    const key = card.dataset.key;
+    if (folded.has(key)) card.classList.add('collapsed');
+    card.querySelector('h2').addEventListener('click', () => {
+      card.classList.toggle('collapsed');
+      const s = foldedSet();
+      card.classList.contains('collapsed') ? s.add(key) : s.delete(key);
+      localStorage.setItem(FOLD_KEY, JSON.stringify([...s]));
+      // 画面面板展开后尺寸才可测，需重算叠加层
+      if (key === 'live' && !card.classList.contains('collapsed')) setTimeout(fitCanvas, 0);
+    });
+  });
+}
+
+/* ---------- 证据截图灯箱 ---------- */
+const lb = $('#lightbox');
+function openLightbox(src, title, meta){
+  $('#lb-img').src = src;
+  $('#lb-title').textContent = title || '';
+  $('#lb-meta').textContent = meta || '';
+  $('#lb-open').onclick = () => window.open(src, '_blank', 'noopener');
+  lb.hidden = false;
+}
+function closeLightbox(){ lb.hidden = true; $('#lb-img').removeAttribute('src'); }
+$('#lb-close').onclick = closeLightbox;
+$('#lb-img').onclick = closeLightbox;
+lb.addEventListener('click', e => { if (e.target === lb) closeLightbox(); });
+addEventListener('keydown', e => { if (e.key === 'Escape' && !lb.hidden) closeLightbox(); });
+
+// 事件列表是轮询重建的，用事件委托绑定点击
+$('#events').addEventListener('click', e => {
+  const img = e.target.closest('img');
+  if (!img) return;
+  const ev = img.closest('.ev');
+  openLightbox(img.src, ev?.dataset.title || '证据截图', ev?.dataset.meta || '');
+});
 
 addEventListener('resize', fitCanvas);
 video.addEventListener('load', fitCanvas);
-refreshSelUI(); loadParams(); poll(); pollEvents();
+initFolding(); refreshSelUI(); loadParams(); poll(); pollEvents();
 setInterval(poll, 1000);
 setInterval(pollEvents, 5000);
 </script>
