@@ -33,13 +33,24 @@
   #stage{position:relative;line-height:0;background:#000}
   #stage img{width:100%;height:auto;display:block}
   #overlay{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
-  /* 设备投屏 */
-  #dev-stage{position:relative;background:#000;min-height:180px;line-height:0}
-  #dev-video{width:100%;height:auto;display:block}
-  #dev-video:not([src]){display:none}
-  #dev-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-                   color:var(--dim);font-size:13px;line-height:1.6;text-align:center;padding:20px}
-  #dev-stage.live #dev-placeholder{display:none}
+  /* 设备投屏：一块屏一格，格数跟随相机能检测的屏幕数 */
+  #dev-grid{display:grid;gap:10px;padding:10px}
+  #dev-grid.n1{grid-template-columns:1fr}
+  #dev-grid.n2{grid-template-columns:repeat(2,1fr)}
+  #dev-grid.n3{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:900px){#dev-grid.n2,#dev-grid.n3{grid-template-columns:1fr}}
+  .dev-cell{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#000}
+  .dev-cell .cap{display:flex;align-items:center;gap:8px;padding:6px 10px;
+                 background:#232a36;font-size:12px;color:var(--dim);line-height:1.4}
+  .dev-cell .cap .sn{flex:none}
+  .dev-cell .cap .nm{color:var(--fg);font-weight:600}
+  .dev-cell .cap .rt{margin-left:auto;font-variant-numeric:tabular-nums}
+  .dev-shot{position:relative;background:#000;min-height:110px;line-height:0}
+  .dev-shot img{width:100%;height:auto;display:block;cursor:zoom-in}
+  .dev-shot img:not([src]){display:none}
+  .dev-shot .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+                color:var(--dim);font-size:12px;text-align:center;padding:14px}
+  .dev-shot.live .ph{display:none}
   .toolbar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px;border-top:1px solid var(--line)}
   button{background:#232a36;color:var(--fg);border:1px solid var(--line);border-radius:7px;
          padding:7px 13px;font-size:13px;cursor:pointer}
@@ -115,10 +126,7 @@
     <div class="card" data-key="devscr" style="margin-top:16px">
       <h2>设备投屏 <span class="pill" id="dev-pill">—</span><span class="chev">▾</span></h2>
       <div class="fold">
-        <div id="dev-stage">
-          <img id="dev-video" alt="device screen">
-          <div id="dev-placeholder">等待设备画面…</div>
-        </div>
+        <div id="dev-grid"><div class="empty">等待设备…</div></div>
         <div class="toolbar">
           <button id="btn-dev-restart">重连投屏</button>
           <span class="hint" style="padding:0;align-self:center" id="dev-status">—</span>
@@ -340,41 +348,77 @@ async function pollEvents(){
   }).join('') : '<div class="empty">暂无事件</div>';
 }
 
-/* ---------- 设备投屏 ---------- */
-const devImg = $('#dev-video'), devStage = $('#dev-stage');
-let devStreamOn = false;
+/* ---------- 设备投屏（多屏，格数跟随相机屏数） ---------- */
+const devGrid = $('#dev-grid');
+let devCount = -1;                 // 当前已建的格子数，仅在变化时重建 DOM
 
-function startDevStream(){
-  if (devStreamOn) return;
-  devStreamOn = true;
-  // 加时间戳避免浏览器复用已断开的旧连接
-  devImg.src = '/device_stream?t=' + Date.now();
+function buildDevGrid(screens){
+  devGrid.className = 'n' + Math.min(3, Math.max(1, screens.length));
+  devGrid.innerHTML = screens.map(s => `
+    <div class="dev-cell" data-i="${s.index}">
+      <div class="cap">
+        <span class="sn">D${s.index + 1}</span>
+        <span class="nm">${s.name}</span>
+        <span class="rt" data-rt>—</span>
+      </div>
+      <div class="dev-shot">
+        <img alt="${s.name}" title="点击查看大图">
+        <div class="ph">连接中…</div>
+      </div>
+    </div>`).join('');
+  // MJPEG 流一格一条长连接，只在重建时挂 src，避免每次轮询都重连
+  devGrid.querySelectorAll('.dev-cell').forEach(cell => {
+    const img = cell.querySelector('img'), shot = cell.querySelector('.dev-shot');
+    img.addEventListener('load', () => shot.classList.add('live'));
+    img.addEventListener('error', () => shot.classList.remove('live'));
+    img.src = `/device_stream/${cell.dataset.i}?t=${Date.now()}`;
+  });
 }
-devImg.addEventListener('load', () => devStage.classList.add('live'));
-devImg.addEventListener('error', () => { devStreamOn = false; devStage.classList.remove('live'); });
 
 $('#btn-dev-restart').onclick = async () => {
   const b = $('#btn-dev-restart'); b.disabled = true;
   try { await api('/api/device_screen/restart', 'POST'); }
   catch (e) { alert('重连失败: ' + e.message); }
-  devStreamOn = false; devImg.removeAttribute('src'); devStage.classList.remove('live');
-  setTimeout(startDevStream, 1200);
+  devCount = -1;                   // 强制重建，重新拉流
   b.disabled = false;
 };
+
+// 投屏画面同样点开看大图（MJPEG 帧可直接作为图片源）
+devGrid.addEventListener('click', e => {
+  const img = e.target.closest('.dev-shot img');
+  if (!img || !img.getAttribute('src')) return;
+  const cell = img.closest('.dev-cell');
+  openLightbox(img.src, cell.querySelector('.nm').textContent,
+               cell.querySelector('[data-rt]').textContent);
+});
 
 async function pollDevice(){
   let d;
   try { d = await api('/api/device_screen'); } catch { return; }
   const pill = $('#dev-pill');
-  pill.textContent = d.connected ? `${d.model || d.serial || '设备'} · ${d.width}x${d.height} · ${d.fps}fps`
-                                 : (d.status || '未连接');
+  const screens = d.screens || [];
+  pill.textContent = d.connected
+    ? `${d.model || d.serial || '设备'} · ${screens.length}/${d.display_count} 块屏`
+    : (d.status || '未连接');
   pill.className = 'pill ' + (d.connected ? 'ok' : 'bad');
   $('#dev-status').textContent = d.enabled
     ? `${d.status}${d.serial ? '　序列号 ' + d.serial : ''}`
     : d.status;
-  if (d.connected) startDevStream();
-  else { devStage.classList.remove('live');
-         $('#dev-placeholder').textContent = d.status || '未连接设备'; }
+
+  if (!screens.length){
+    if (devCount !== 0){ devGrid.className = ''; devGrid.innerHTML =
+      `<div class="empty">${d.status || '未连接设备'}</div>`; devCount = 0; }
+    return;
+  }
+  if (screens.length !== devCount){ buildDevGrid(screens); devCount = screens.length; }
+  screens.forEach(s => {
+    const cell = devGrid.querySelector(`.dev-cell[data-i="${s.index}"]`);
+    if (!cell) return;
+    cell.querySelector('[data-rt]').textContent =
+      s.connected ? `${s.width}x${s.height} · ${s.fps}fps` : s.status;
+    if (!s.connected) cell.querySelector('.dev-shot').classList.remove('live');
+    cell.querySelector('.ph').textContent = s.status;
+  });
 }
 
 /* ---------- 面板折叠（状态存 localStorage，刷新后保持） ---------- */

@@ -5,7 +5,8 @@
   * MJPEG 实时画面（带 S1/S2/S3 标注与红框告警）
   * 网页内鼠标框选 ROI、一键自动标定
   * 网页内调相机参数（亮度/对比度/饱和度/增益/曝光/自动曝光）
-  * 设备投屏：adb 拉 Android 设备屏幕，显示在相机画面下方作对照
+  * 设备投屏：adb 拉 Android 设备每块物理屏，路数跟随相机能检测的屏幕数，
+    显示在相机画面下方作对照
   * 事件列表与证据截图
 
 相机同一时刻只能被一个进程占用：本服务运行期间不要再开 camera_diag.py 预览。
@@ -48,7 +49,7 @@ from camera_diag import (  # noqa: E402
     parse_rois,
     run_detect_multi,
 )
-from device_screen import DeviceScreenService, pick_device  # noqa: E402
+from device_screen import DeviceScreenManager, pick_device  # noqa: E402
 from platform_compat import set_auto_exposure  # noqa: E402
 
 try:
@@ -303,7 +304,7 @@ class MonitorService:
 
 # ---------------------------------------------------------------- HTTP
 service: MonitorService = None
-device_screen: DeviceScreenService = None      # 设备投屏（可选，无设备时降级为"未连接"）
+device_screen: DeviceScreenManager = None      # 设备多屏投屏（无设备时降级为"未连接"）
 server = None                     # uvicorn.Server，供 /stream 感知退出信号
 app = FastAPI(title="Screen Anomaly Monitor")
 
@@ -335,26 +336,8 @@ def index():
 
 @app.get("/stream")
 async def stream():
-    """MJPEG 多部件流，浏览器 <img src="/stream"> 直接显示。"""
-    boundary = "frame"
-
-    async def gen():
-        last = None
-        try:
-            while not _should_stop():
-                jpg = service.snapshot_jpeg()
-                if jpg is not None and jpg is not last:
-                    last = jpg
-                    yield (b"--" + boundary.encode() + b"\r\n"
-                           b"Content-Type: image/jpeg\r\n"
-                           b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n"
-                           + jpg + b"\r\n")
-                await asyncio.sleep(0.03)
-        except asyncio.CancelledError:      # 客户端断开：正常收尾，不刷栈
-            pass
-
-    return StreamingResponse(
-        gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
+    """相机画面 MJPEG 流，浏览器 <img src="/stream"> 直接显示。"""
+    return _mjpeg(lambda: service.snapshot_jpeg() if service else None)
 
 
 @app.get("/api/status")
@@ -431,16 +414,15 @@ def api_event_shot(event_id: str):
 
 
 # ---------------------------------------------------------------- 设备投屏
-@app.get("/device_stream")
-async def device_stream():
-    """设备屏幕 MJPEG 流；未连接设备时输出占位帧而非 404，避免 <img> 报错。"""
+def _mjpeg(get_jpeg):
+    """把"取一帧 JPEG"的回调包装成 MJPEG 多部件流。"""
     boundary = "frame"
 
     async def gen():
         last = None
         try:
             while not _should_stop():
-                jpg = device_screen.snapshot_jpeg() if device_screen else None
+                jpg = get_jpeg()
                 if jpg is not None and jpg is not last:
                     last = jpg
                     yield (b"--" + boundary.encode() + b"\r\n"
@@ -455,10 +437,19 @@ async def device_stream():
         gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
 
 
+@app.get("/device_stream/{index}")
+async def device_stream(index: int):
+    """第 index 块设备屏的 MJPEG 流（index 从 0 起，与相机 S1/S2/S3 顺序对应）。"""
+    if not device_screen:
+        raise HTTPException(409, "设备投屏未启用")
+    return _mjpeg(lambda: (lambda s: s.snapshot_jpeg() if s else None)(device_screen.get(index)))
+
+
 @app.get("/api/device_screen")
 def api_device_screen():
     if not device_screen:
-        return {"enabled": False, "connected": False, "status": "未启用（--no-device-screen）"}
+        return {"enabled": False, "connected": False, "screens": [],
+                "status": "未启用（--no-device-screen）"}
     return {"enabled": True, **device_screen.status_dict()}
 
 
@@ -466,8 +457,7 @@ def api_device_screen():
 def api_device_restart():
     if not device_screen:
         raise HTTPException(409, "设备投屏未启用")
-    device_screen.restart()
-    return {"ok": True}
+    return {"ok": True, "restarted": device_screen.restart_all()}
 
 
 @app.get("/api/snapshot")
@@ -494,7 +484,9 @@ def main():
     ap.add_argument("--no-device-screen", action="store_true",
                     help="不启用 Android 设备投屏（默认自动探测 adb 设备）")
     ap.add_argument("--adb-serial", help="指定 adb 设备序列号（多台设备时）")
-    ap.add_argument("--device-size", default="1280x800", help="投屏分辨率（默认1280x800）")
+    ap.add_argument("--device-displays",
+                    help="手动指定投屏的 display-id 及顺序，逗号分隔；"
+                         "缺省按设备 port 顺序自动枚举")
     ap.add_argument("--device-bitrate", default="4M", help="投屏码率（默认4M）")
     args = ap.parse_args()
 
@@ -525,11 +517,20 @@ def main():
     service.start()
 
     if not args.no_device_screen:
-        device_screen = DeviceScreenService(serial=args.adb_serial, size=args.device_size,
-                                            bitrate=args.device_bitrate)
+        def camera_screen_count():
+            """相机当前能检测几块屏，就开几路投屏（未标定 ROI 时用 --screens）。"""
+            with service.lock:
+                return len(service.rois) or service.max_screens
+
+        device_screen = DeviceScreenManager(
+            serial=args.adb_serial, bitrate=args.device_bitrate,
+            target_count=camera_screen_count,
+            display_ids=[d.strip() for d in args.device_displays.split(",") if d.strip()]
+                        if args.device_displays else None)
         device_screen.start()
         serial, model = pick_device(args.adb_serial)
-        print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}")
+        print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}"
+              f"，路数跟随相机屏数（当前 {camera_screen_count()}）")
 
     import socket
     try:

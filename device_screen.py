@@ -1,18 +1,18 @@
 """
-设备投屏采集 —— 把 Android 设备屏幕实时取到本地
-================================================
-用 `adb exec-out screenrecord --output-format=h264` 把设备画面以 H.264 裸流
-写进 FIFO，再用 OpenCV（自带 FFmpeg）解码，产出与相机同格式的 JPEG 帧。
+设备投屏采集 —— 把 Android 设备的每块物理屏实时取到本地
+=======================================================
+用 `adb exec-out screenrecord --display-id ID` 把指定显示屏以 H.264 裸流写进
+FIFO，再用 OpenCV（自带 FFmpeg）解码，产出与相机同格式的 JPEG 帧。
 
-选这条路而不是 scrcpy 的原因：只依赖 adb，无需 `apt install scrcpy`、
-无需 `modprobe v4l2loopback`、无需系统 ffmpeg，因此不需要 root 权限。
-效果等价：都是把设备屏幕镜像过来。
+选这条路而不是 scrcpy：只依赖 adb，无需 `apt install scrcpy`、无需
+`modprobe v4l2loopback`、无需系统 ffmpeg，因此不需要 root。
 
-screenrecord 单次最长 180 秒，到点自动重启；设备掉线时退到"未连接"
-并周期重试，不会让服务崩掉。
+车机常有多块屏（中控 / 仪表 / 后排）。DeviceScreenManager 按相机当前能检测的
+屏幕数决定开几路投屏，相机侧重新标定后自动增减，两边编号一一对应。
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -22,9 +22,16 @@ from pathlib import Path
 
 import cv2
 
-SEGMENT_S = 170          # 单段录制时长，留出余量避免撞上 180s 硬上限
-RETRY_S = 3.0            # 设备不在时的重试间隔
-OPEN_TIMEOUT_S = 20.0    # 等待首帧的上限
+RETRY_S = 3.0            # 设备不在 / 出错时的重试间隔
+MAX_LONG_EDGE = 1280     # 投屏长边上限，按原始宽高比缩放后再送编码器
+SYNC_S = 2.0             # 管理器检查"该开几路"的间隔
+
+
+# ---------------------------------------------------------------- adb 查询
+def _adb(serial, *args, timeout=15):
+    cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
+    return subprocess.check_output(cmd, text=True, timeout=timeout,
+                                   stderr=subprocess.DEVNULL)
 
 
 def list_devices():
@@ -32,7 +39,7 @@ def list_devices():
     if not shutil.which("adb"):
         return []
     try:
-        out = subprocess.check_output(["adb", "devices", "-l"], text=True, timeout=10)
+        out = _adb(None, "devices", "-l", timeout=10)
     except Exception:
         return []
     devices = []
@@ -54,12 +61,60 @@ def pick_device(serial=None):
     return None, ""
 
 
-class DeviceScreenService:
-    """后台线程持续拉设备屏幕，产出 JPEG 供 HTTP 取用。"""
+def list_displays(serial=None):
+    """列出设备的物理显示屏，按 port 排序（与实际接线顺序一致，编号稳定）。
 
-    def __init__(self, serial=None, size="1280x800", bitrate="4M", jpeg_quality=70):
+    返回 [{"display_id", "port", "name", "width", "height"}, ...]。
+    虚拟屏（录屏器等 type=VIRTUAL）会被排除——它不是真实存在的一块屏。
+    """
+    try:
+        sf = _adb(serial, "shell", "dumpsys", "SurfaceFlinger", "--display-id")
+    except Exception:
+        return []
+
+    displays = []
+    for m in re.finditer(r"^Display (\d+) \(HWC display \d+\): port=(\d+).*?displayName=\"([^\"]*)\"",
+                         sf, re.M):
+        displays.append({"display_id": m.group(1), "port": int(m.group(2)),
+                         "name": m.group(3), "width": 0, "height": 0})
+    if not displays:
+        return []
+
+    # 从 dumpsys display 补上人类可读名与分辨率（按 uniqueId 里的 display_id 关联）
+    try:
+        dd = _adb(serial, "shell", "dumpsys", "display", timeout=20)
+        for m in re.finditer(r'DisplayDeviceInfo\{"([^"]+)": uniqueId="local:(\d+)", (\d+) x (\d+)', dd):
+            name, did, w, h = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+            for d in displays:
+                if d["display_id"] == did:
+                    d["name"], d["width"], d["height"] = name, w, h
+    except Exception:
+        pass
+
+    displays.sort(key=lambda d: d["port"])
+    return displays
+
+
+def scaled_size(width, height, long_edge=MAX_LONG_EDGE):
+    """按原始宽高比缩到长边不超过 long_edge，并对齐到偶数（AVC 编码器要求）。
+
+    车机仪表屏常是 1920x480 这类超宽比例，统一压成固定尺寸会拉变形。
+    """
+    if width <= 0 or height <= 0:
+        return None
+    scale = min(1.0, long_edge / max(width, height))
+    w = max(16, int(width * scale) // 2 * 2)
+    h = max(16, int(height * scale) // 2 * 2)
+    return f"{w}x{h}"
+
+
+# ---------------------------------------------------------------- 单屏投屏
+class DeviceScreenService:
+    """后台线程持续拉某一块显示屏，产出 JPEG 供 HTTP 取用。"""
+
+    def __init__(self, serial, display, bitrate="4M", jpeg_quality=70):
         self.serial = serial
-        self.size = size
+        self.display = display              # list_displays() 的一项
         self.bitrate = bitrate
         self.jpeg_quality = jpeg_quality
 
@@ -68,8 +123,6 @@ class DeviceScreenService:
         self.running = True
         self.connected = False
         self.status = "启动中"
-        self.model = ""
-        self.active_serial = None
         self.width = self.height = 0
         self.fps = 0.0
         self._proc = None
@@ -77,6 +130,7 @@ class DeviceScreenService:
         self._fifo = self._tmpdir / "screen.h264"
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
+    # ------------------------------------------------------------ 生命周期
     def start(self):
         self._thread.start()
 
@@ -91,7 +145,7 @@ class DeviceScreenService:
             return self._jpeg
 
     def restart(self):
-        """外部触发重连：杀掉当前录制进程，主循环会自动重开一段。"""
+        """外部触发重连：杀掉录制进程，主循环自动重开。"""
         self._kill_proc()
         return True
 
@@ -100,13 +154,10 @@ class DeviceScreenService:
         p, self._proc = self._proc, None
         if p and p.poll() is None:
             try:
-                p.terminate()
-                p.wait(timeout=3)
+                p.terminate(); p.wait(timeout=3)
             except Exception:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+                try: p.kill()
+                except Exception: pass
 
     def _set_status(self, text, connected=None):
         with self.lock:
@@ -117,55 +168,44 @@ class DeviceScreenService:
     def _loop(self):
         enc = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         while self.running:
-            serial, model = pick_device(self.serial)
-            if not serial:
-                self._set_status("未连接设备（adb devices 为空）", connected=False)
-                with self.lock:
-                    self.active_serial, self.model, self.fps = None, "", 0.0
-                time.sleep(RETRY_S)
-                continue
-
-            with self.lock:
-                self.active_serial, self.model = serial, model
-            self._set_status(f"连接中… ({model or serial})")
             try:
-                self._run_segment(serial, enc)
+                self._run_once(enc)
             except Exception as e:
                 self._set_status(f"投屏出错: {e}", connected=False)
+            if self.running:
                 time.sleep(RETRY_S)
 
-    def _run_segment(self, serial, enc):
-        """录一段并解码。screenrecord 到时限自然结束，返回后外层重开一段。"""
+    def _run_once(self, enc):
         if self._fifo.exists():
             self._fifo.unlink()
         os.mkfifo(self._fifo)
 
-        cmd = (f"adb -s {serial} exec-out screenrecord --output-format=h264 "
-               f"--size {self.size} --bit-rate {self.bitrate} "
-               f"--time-limit {SEGMENT_S} - > {self._fifo}")
-        # 经 shell 重定向：写端会阻塞到读端打开，父进程不受影响
+        size = scaled_size(self.display.get("width", 0), self.display.get("height", 0))
+        # --time-limit 0 去掉 180 秒硬上限，长时间监控不再有分段重启的画面停顿
+        cmd = (f"adb -s {self.serial} exec-out screenrecord --output-format=h264 "
+               f"--display-id {self.display['display_id']} "
+               + (f"--size {size} " if size else "")
+               + f"--bit-rate {self.bitrate} --time-limit 0 - > {self._fifo}")
         self._proc = subprocess.Popen(cmd, shell=True,
                                       stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
+        self._set_status("连接中…")
         cap = cv2.VideoCapture(str(self._fifo))
         if not cap.isOpened():
-            self._set_status("无法解码设备画面（screenrecord 不可用？）", connected=False)
+            self._set_status("无法解码该屏画面", connected=False)
             self._kill_proc()
-            time.sleep(RETRY_S)
             return
 
-        t_open, n, t_fps = time.time(), 0, time.time()
-        got_first = False
+        got_first, n, t_fps = False, 0, time.time()
         while self.running:
             ok, frame = cap.read()
             if not ok:
-                break                       # 本段结束（到时限或设备断开）
+                break
             if not got_first:
                 got_first = True
                 with self.lock:
                     self.height, self.width = frame.shape[:2]
                 self._set_status("投屏中", connected=True)
-
             ok, buf = cv2.imencode(".jpg", frame, enc)
             if ok:
                 with self.lock:
@@ -179,21 +219,148 @@ class DeviceScreenService:
 
         cap.release()
         self._kill_proc()
-        if not got_first and time.time() - t_open > OPEN_TIMEOUT_S:
-            self._set_status("等待设备画面超时", connected=False)
-            time.sleep(RETRY_S)
+        self._set_status("已断开，重连中…", connected=False)
 
-    def status_dict(self):
+    def status_dict(self, index):
         with self.lock:
             return {
-                "available": bool(shutil.which("adb")),
+                "index": index,
+                "display_id": self.display["display_id"],
+                "port": self.display.get("port"),
+                "name": self.display.get("name") or f"Display {self.display.get('port')}",
+                "native": f"{self.display.get('width')}x{self.display.get('height')}",
                 "connected": self.connected,
                 "status": self.status,
-                "serial": self.active_serial,
-                "model": self.model,
                 "width": self.width,
                 "height": self.height,
                 "fps": round(self.fps, 1),
-                "size": self.size,
-                "bitrate": self.bitrate,
             }
+
+
+# ---------------------------------------------------------------- 多屏管理
+class DeviceScreenManager:
+    """按相机当前能检测的屏幕数决定开几路投屏，设备增减时自动跟随。"""
+
+    def __init__(self, serial=None, bitrate="4M", jpeg_quality=70,
+                 target_count=None, display_ids=None):
+        self.serial = serial
+        self.bitrate = bitrate
+        self.jpeg_quality = jpeg_quality
+        self.target_count = target_count or (lambda: 3)   # 由相机侧提供
+        self.display_ids = display_ids                    # 手动指定顺序时用
+
+        self.lock = threading.Lock()
+        self.services = []
+        self.displays = []
+        self.active_serial = None
+        self.model = ""
+        self.status = "启动中"
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+        with self.lock:
+            svcs, self.services = self.services, []
+        for s in svcs:
+            s.stop()
+        self._thread.join(timeout=5)
+
+    def get(self, index):
+        with self.lock:
+            return self.services[index] if 0 <= index < len(self.services) else None
+
+    def restart_all(self):
+        with self.lock:
+            svcs = list(self.services)
+        for s in svcs:
+            s.restart()
+        return len(svcs)
+
+    def _stop_all(self, note):
+        with self.lock:
+            svcs, self.services = self.services, []
+            self.status = note
+        for s in svcs:
+            s.stop()
+
+    def _loop(self):
+        while self.running:
+            serial, model = pick_device(self.serial)
+            if not serial:
+                if self.services:
+                    self._stop_all("未连接设备（adb devices 为空）")
+                else:
+                    with self.lock:
+                        self.status = "未连接设备（adb devices 为空）"
+                with self.lock:
+                    self.active_serial, self.model, self.displays = None, "", []
+                time.sleep(RETRY_S)
+                continue
+
+            if serial != self.active_serial:
+                self._stop_all("设备已更换，重新枚举")
+                displays = list_displays(serial)
+                if self.display_ids:      # 手动指定则按给定顺序过滤
+                    order = {d: i for i, d in enumerate(self.display_ids)}
+                    displays = sorted((d for d in displays if d["display_id"] in order),
+                                      key=lambda d: order[d["display_id"]])
+                with self.lock:
+                    self.active_serial, self.model, self.displays = serial, model, displays
+                if not displays:
+                    with self.lock:
+                        self.status = "未枚举到物理显示屏"
+                    time.sleep(RETRY_S)
+                    continue
+
+            self._sync()
+            time.sleep(SYNC_S)
+
+    def _sync(self):
+        """把投屏路数对齐到 min(设备屏数, 相机能检测的屏数)。"""
+        try:
+            want = int(self.target_count())
+        except Exception:
+            want = len(self.displays)
+        with self.lock:
+            displays = list(self.displays)
+            cur = len(self.services)
+        want = max(0, min(want, len(displays)))
+        if want == cur:
+            with self.lock:
+                self.status = f"投屏 {cur}/{len(displays)} 块屏"
+            return
+
+        if want < cur:                    # 相机侧屏数减少：关掉多余的
+            with self.lock:
+                extra, self.services = self.services[want:], self.services[:want]
+            for s in extra:
+                s.stop()
+        else:                             # 增加：为新的显示屏开流
+            for i in range(cur, want):
+                svc = DeviceScreenService(self.active_serial, displays[i],
+                                          bitrate=self.bitrate,
+                                          jpeg_quality=self.jpeg_quality)
+                svc.start()
+                with self.lock:
+                    self.services.append(svc)
+        with self.lock:
+            self.status = f"投屏 {len(self.services)}/{len(displays)} 块屏"
+
+    def status_dict(self):
+        with self.lock:
+            svcs = list(self.services)
+            base = {
+                "available": bool(shutil.which("adb")),
+                "serial": self.active_serial,
+                "model": self.model,
+                "status": self.status,
+                "display_count": len(self.displays),
+                "displays": [dict(d) for d in self.displays],
+            }
+        base["screens"] = [s.status_dict(i) for i, s in enumerate(svcs)]
+        base["connected"] = any(s["connected"] for s in base["screens"])
+        return base

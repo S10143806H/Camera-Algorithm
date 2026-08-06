@@ -94,7 +94,8 @@ export QT_QPA_PLATFORM=xcb                         # Wayland 下预览窗口异�
 | `--quality N` | `web_monitor` | MJPEG 质量 1–100，默认 75；带宽紧张可调低 |
 | `--no-device-screen` | `web_monitor` | 关掉设备投屏（默认自动探测 adb 设备） |
 | `--adb-serial S` | `web_monitor` | 多台设备时指定序列号 |
-| `--device-size` / `--device-bitrate` | `web_monitor` | 投屏分辨率 / 码率，默认 `1280x800` / `4M` |
+| `--device-displays` | `web_monitor` | 手动指定投屏的 display-id 及顺序（逗号分隔），缺省按 port 自动枚举 |
+| `--device-bitrate` | `web_monitor` | 投屏码率，默认 `4M`；分辨率按各屏原始宽高比自动缩放（长边 ≤1280） |
 | `--finalize` | `analyze_screen_*` | 合并分段视频 + 生成证据图（需 ffmpeg） |
 | `--recursive` | `analyze_black_screens` | 递归扫描 `--root` 子目录 |
 
@@ -153,7 +154,7 @@ python3 web_monitor.py --device 0 --screens 3        # 默认 0.0.0.0:8000
 | 框选 ROI | 点「框选 ROI」后在画面上拖框，每拖一次加一块，「应用」生效 |
 | 自动标定 | 一键调用同一套多屏标定算法 |
 | 相机参数 | 亮度/对比度/饱和度/增益/曝光/自动曝光，滑动即生效 |
-| **设备投屏** | 相机画面下方并排显示 Android 设备自身屏幕，对照"设备以为在显示什么"与"相机实际看到什么" |
+| **设备投屏** | 相机画面下方并排显示 Android 设备的每块物理屏，**路数跟随相机能检测的屏幕数**；对照"设备以为在显示什么"与"相机实际看到什么" |
 | 事件列表 | 每 5 秒刷新，含证据截图、屏幕编号、score；**点击截图看大图**（ESC 关闭，可新标签页打开原图） |
 | 面板折叠 | 四个面板（实时画面/屏幕状态/相机参数/事件）点标题栏即可折叠，状态存 localStorage，刷新后保持 |
 
@@ -173,11 +174,19 @@ python3 web_monitor.py --adb-serial A41AEC42       # 多台设备时指定
 python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 ```
 
+**多屏**：车机常有中控 / 仪表 / 后排多块屏。服务按 `dumpsys SurfaceFlinger --display-id`
+枚举物理屏（排除虚拟录屏屏），按 port 排序编号 D1/D2/D3，
+**开几路由相机当前能检测的屏幕数决定** —— 相机侧重新标定 ROI 后，投屏路数自动增减。
+
+每路按该屏原始宽高比缩放（长边 ≤1280），仪表屏这类 1920x480 超宽比例不会被拉变形。
+
 | 行为 | 说明 |
 |---|---|
 | 首帧延迟 | 约 5 秒（FFmpeg 探测裸流），之后追平实时 |
-| 分段重启 | `screenrecord` 单次上限 180 秒，到点自动重开，画面短暂停顿属正常 |
+| 路数同步 | 相机 ROI 数变化后 1–6 秒内跟随 |
+| 长时录制 | `--time-limit 0` 去掉 180 秒上限，不再有分段重启的画面停顿 |
 | 设备掉线 | 退到"未连接"并每 3 秒重试，插回后自动恢复，不影响相机检测 |
+| 看大图 | 点任一路投屏画面可放大查看 |
 | 手动重连 | 网页上点「重连投屏」 |
 
 ### HTTP 接口
@@ -193,8 +202,8 @@ python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 | POST | `/api/detect` | 检测开关 |
 | GET | `/api/events` | 事件列表 |
 | GET | `/api/events/{id}/screenshot` | 事件证据截图 |
-| GET | `/device_stream` | 设备投屏 MJPEG 流 |
-| GET | `/api/device_screen` | 投屏状态（是否连接、序列号、机型、分辨率、fps） |
+| GET | `/device_stream/{i}` | 第 i 块设备屏的 MJPEG 流（i 从 0 起） |
+| GET | `/api/device_screen` | 投屏状态（设备、物理屏列表、每路分辨率与 fps） |
 | POST | `/api/device_screen/restart` | 重连投屏 |
 
 停止服务：
