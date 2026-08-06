@@ -49,7 +49,9 @@ from camera_diag import (  # noqa: E402
     parse_rois,
     run_detect_multi,
 )
+from device_context import DeviceContext  # noqa: E402
 from device_screen import DeviceScreenManager, pick_device  # noqa: E402
+from gtmp_link import GtmpLink  # noqa: E402
 from platform_compat import set_auto_exposure  # noqa: E402
 
 try:
@@ -214,6 +216,7 @@ class MonitorService:
                 ev = emit_merged_event(evidence, self.source_name, self.event_root, seq,
                                        notifier=self.notifier, screen_no=no,
                                        screen_roi=roi, screen_total=total)
+                enrich_event(ev, no)          # 附加设备归因与 GTMP 任务上下文
                 with self.lock:
                     self.events.append(ev)
                     del self.events[:-MAX_EVENTS_KEPT]
@@ -302,9 +305,43 @@ class MonitorService:
         }
 
 
+def enrich_event(ev, screen_no):
+    """给事件补上设备侧归因与 GTMP 任务上下文，并回写 event.json。
+
+    相机只能看到"黑了"，判不出是 GTMP 正常重启还是真故障；
+    这里把设备状态 / logcat / 该屏 framebuffer 一并落进证据里。
+    """
+    import json as _json
+    try:
+        if device_ctx:
+            # 相机第 N 块屏 -> 设备第 N 块屏（两边都按物理顺序编号）
+            did = None
+            if device_screen and screen_no:
+                with device_screen.lock:
+                    ds = list(device_screen.displays)
+                if 0 < screen_no <= len(ds):
+                    did = ds[screen_no - 1]["display_id"]
+            ev["device_context"] = device_ctx.classify(display_id=did, camera_dark=True)
+            ev["device_state"] = device_ctx.status_dict()
+        if gtmp:
+            ev["gtmp"] = gtmp.snapshot()
+        shot = Path(ev["screenshot"])
+        (shot.parent / "event.json").write_text(
+            _json.dumps(ev, ensure_ascii=False, indent=2), encoding="utf-8")
+        v = (ev.get("device_context") or {}).get("verdict")
+        if v:
+            normal = (ev["device_context"] or {}).get("is_normal")
+            tag = "正常行为" if normal else ("疑似故障" if normal is False else "无法判断")
+            print(f"     归因: {v} ({tag}) — {ev['device_context']['reason']}")
+    except Exception as e:
+        print(f"⚠️ 事件归因失败: {e}")
+
+
 # ---------------------------------------------------------------- HTTP
 service: MonitorService = None
 device_screen: DeviceScreenManager = None      # 设备多屏投屏（无设备时降级为"未连接"）
+device_ctx: DeviceContext = None  # 设备状态 + logcat，用于黑屏归因
+gtmp: GtmpLink = None             # GTMP 任务上下文（可选）
 server = None                     # uvicorn.Server，供 /stream 感知退出信号
 app = FastAPI(title="Screen Anomaly Monitor")
 
@@ -460,6 +497,16 @@ def api_device_restart():
     return {"ok": True, "restarted": device_screen.restart_all()}
 
 
+@app.get("/api/device_context")
+def api_device_context():
+    """设备实时状态（uptime / 开机完成 / 各屏电源态）与最近关键日志。"""
+    if not device_ctx:
+        return {"enabled": False}
+    return {"enabled": True, **device_ctx.status_dict(),
+            "recent_logs": device_ctx.recent_logs(window_s=120, limit=30),
+            "gtmp": gtmp.snapshot() if gtmp else None}
+
+
 @app.get("/api/snapshot")
 def api_snapshot():
     """当前帧单张 JPEG，便于外部脚本抓图或做健康检查。"""
@@ -471,7 +518,7 @@ def api_snapshot():
 
 # ---------------------------------------------------------------- main
 def main():
-    global service, device_screen
+    global service, device_screen, device_ctx, gtmp
     ap = argparse.ArgumentParser(description="屏幕异常实时监控 Web 服务")
     ap.add_argument("--device", type=int, default=None, help="相机 index，缺省则自动诊断")
     ap.add_argument("--screens", type=int, default=3, help="最多识别几块屏幕（默认3）")
@@ -488,6 +535,10 @@ def main():
                     help="手动指定投屏的 display-id 及顺序，逗号分隔；"
                          "缺省按设备 port 顺序自动枚举")
     ap.add_argument("--device-bitrate", default="4M", help="投屏码率（默认4M）")
+    ap.add_argument("--no-device-context", action="store_true",
+                    help="不采集设备状态与 logcat（默认开启，用于黑屏归因）")
+    ap.add_argument("--gtmp-task", type=int, help="关联 GTMP 任务 ID，事件附带任务上下文")
+    ap.add_argument("--gtmp-bench", type=int, help="关联 GTMP 台架 ID，自动跟踪其运行中的任务")
     args = ap.parse_args()
 
     opened = open_device(args.device) if args.device is not None else diagnose_all()
@@ -532,6 +583,16 @@ def main():
         print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}"
               f"，路数跟随相机屏数（当前 {camera_screen_count()}）")
 
+    if not args.no_device_context:
+        device_ctx = DeviceContext(serial=args.adb_serial)
+        device_ctx.start()
+        print("🩺 设备归因: 开（uptime/开机标志/各屏电源态 + logcat 滚动缓冲）")
+
+    if args.gtmp_task or args.gtmp_bench:
+        gtmp = GtmpLink(task_id=args.gtmp_task, bench_id=args.gtmp_bench)
+        gtmp.start()
+        print(f"🔗 GTMP: 关联 {'任务 ' + str(args.gtmp_task) if args.gtmp_task else '台架 ' + str(args.gtmp_bench)}")
+
     import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -553,6 +614,10 @@ def main():
         service.stop()
         if device_screen:
             device_screen.stop()
+        if device_ctx:
+            device_ctx.stop()
+        if gtmp:
+            gtmp.stop()
     return 0
 
 

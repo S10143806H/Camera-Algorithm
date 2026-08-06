@@ -327,6 +327,62 @@ diag_captures/live_<日期>/black_screen/
 
 ---
 
+## 黑屏归因（区分正常重启与真故障）
+
+GTMP 跑测试时设备会正常重启、正常灭屏，屏幕本来就该黑。相机只能看到"黑了"，
+判不出是不是问题。`device_context.py` 在后台采集设备状态与 logcat，
+事件发生时回溯归因，把正常行为和真故障分开。
+
+| 判定 | 含义 | 正常? | 下一步 |
+|---|---|---|---|
+| `reboot` | uptime 回退 / adb 断连 / `sys.boot_completed=0` | ✅ 正常 | 无需处理 |
+| `screen_off` | 该屏电源态不是 ON（灭屏 / DOZE） | ✅ 正常 | 无需处理 |
+| `device_black` | 屏电源 ON，但设备端 framebuffer 就是黑的 | ❌ 故障 | 查合成器 / 应用侧，看随事件保存的 logcat |
+| `panel_black` | 设备端 framebuffer 正常，相机却看到黑 | ❌ 故障 | 查屏体 / 背光 / 传输链路，**设备侧日志看不出来** |
+| `unknown` | adb 不可用 | — | 检查 adb 连接 |
+
+> `device_black` 与 `panel_black` 的区分是关键：前者设备自己就没出画面，后者设备
+> 出了画面但没显示出来。两者排查方向完全不同，只看 logcat 无法区分。
+
+采集的信号：`uptime`、`sys.boot_completed`、`ro.boot.bootreason`、各屏
+`mScreenState`、该屏 `screencap` 亮度，以及按关键词过滤的滚动 logcat
+（ShutdownThread / boot_progress / DisplayPowerController / Watchdog / ANR 等）。
+
+归因结果写进 `event.json` 的 `device_context` 字段，随证据截图一起归档：
+
+```json
+{
+  "screen_no": 3,
+  "device_context": {
+    "verdict": "device_black",
+    "is_normal": false,
+    "reason": "屏电源 ON 但设备端画面就是黑的（screencap 亮度 0.0），合成器/应用侧未出画面",
+    "screen_state": "ON",
+    "device_mean": 0.0,
+    "logs": ["..."]
+  },
+  "device_state": {"uptime": 67322.0, "boot_completed": true, "boot_reason": "reboot"}
+}
+```
+
+`GET /api/device_context` 可实时查看设备状态与最近关键日志。用
+`--no-device-context` 关闭采集。
+
+### GTMP 关联（可选）
+
+事件里带上当时正在跑的 GTMP 任务，回答"哪个任务、哪个版本、跑到第几步时黑的"。
+
+```bash
+export GTMP_TOKEN="<access token>"      # 未设置则自动跳过
+python3 web_monitor.py --gtmp-task 96671    # 关联指定任务
+python3 web_monitor.py --gtmp-bench 12      # 自动跟踪该台架运行中的任务
+```
+
+只做只读查询，不创建/修改/删除任何 GTMP 数据。任务信息写进 `event.json` 的
+`gtmp` 字段：任务 ID、名称、状态、进度、版本、台架、创建人。
+
+---
+
 ## 飞书告警（可选）
 
 ```bash
