@@ -52,7 +52,7 @@ from camera_diag import (  # noqa: E402
 from device_context import DeviceContext  # noqa: E402
 from device_screen import DeviceScreenManager, pick_device, send_input  # noqa: E402
 from gtmp_link import GtmpLink  # noqa: E402
-from platform_compat import set_auto_exposure  # noqa: E402
+from platform_compat import list_cameras, set_auto_exposure  # noqa: E402
 
 try:
     from analyze_black_screens import calibrate_screen_rois, rois_from_maxbright
@@ -119,6 +119,11 @@ class MonitorService:
         self.event_root = (ROOT / "diag_captures" /
                            f"web_{datetime.now().strftime('%Y%m%d')}" / "black_screen")
         self.source_name = f"camera_{info.get('idx', '?')}"
+        # 掉线自愈：USB 重新枚举后 /dev/videoN 会换号，旧 cap 只会一直读失败
+        self.cam_name = info.get("name") or ""
+        self.cam_status = "采集中"
+        self.cam_online = True
+        self.reconnects = 0
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     # ---------------------------------------------------------- 生命周期
@@ -135,14 +140,74 @@ class MonitorService:
         return self._screen_state.setdefault(
             no, {"streak": 0, "cooldown_until": 0.0, "evidence": [], "last_evi_t": -1e9})
 
+    # ---------------------------------------------------------- 掉线自愈
+    def _reopen_camera(self):
+        """相机掉线后重新枚举并打开。
+
+        USB 重新枚举会让 /dev/videoN 换号（实测 video0 → video1），此时旧 cap
+        只会一直读失败：采集线程空转、MJPEG 全部掉到 ~1fps，页面看着像卡死却
+        没有任何提示。这里按设备名重新找回，找不到名字再退回逐个 index 探测。
+        """
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+        cams = list_cameras()
+        order = []
+        if self.cam_name:                       # 优先按设备名找回同一台相机
+            order += [c for c in cams if c.get("name") == self.cam_name]
+        order += [c for c in cams if c not in order]
+        candidates = []
+        for c in order:
+            digits = "".join(ch for ch in str(c.get("instance_id", "")) if ch.isdigit())
+            if digits:
+                candidates.append(int(digits))
+        candidates += [i for i in range(6) if i not in candidates]
+
+        for idx in candidates:
+            opened = open_device(idx)
+            if not opened:
+                continue
+            cap, info = opened
+            self.cap = cap
+            with self.lock:
+                self.info = info
+                if self.cam_name:
+                    self.info.setdefault("name", self.cam_name)
+                self.cam_online, self.cam_status = True, "采集中"
+                self.reconnects += 1
+            print(f"✅ 相机已重连: idx={idx} {info.get('backend')} "
+                  f"{info.get('w')}x{info.get('h')}（第 {self.reconnects} 次）")
+            return True
+        return False
+
     def _loop(self):
         enc = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         t_last, n = time.time(), 0
+        fail = 0
         while self.running:
             ok, frame = self.cap.read()
             if not ok or frame is None:
+                fail += 1
+                # 连续 30 次(约 1.5s)读不到帧即判掉线，避免偶发丢帧误触发重连
+                if fail == 30:
+                    with self.lock:
+                        self.cam_online = False
+                        self.cam_status = "相机掉线，重连中…"
+                    print("⚠️ 相机连续读帧失败，判定掉线，开始重新枚举…")
+                if fail >= 30 and fail % 30 == 0:
+                    if self._reopen_camera():
+                        fail = 0
+                        continue
+                    with self.lock:
+                        self.cam_status = "相机掉线，重连中…（未找到设备）"
                 time.sleep(0.05)
                 continue
+            if fail:
+                fail = 0
+                with self.lock:
+                    self.cam_online, self.cam_status = True, "采集中"
 
             now = time.time()
             if now - self._last_calib_sample > 0.5:
@@ -291,6 +356,9 @@ class MonitorService:
                    for no, roi, r in results]
         return {
             "device": self.info.get("idx"),
+            "camera_online": self.cam_online,
+            "camera_status": self.cam_status,
+            "camera_reconnects": self.reconnects,
             "backend": self.info.get("backend"),
             "width": int(self.info.get("w") or 0),
             "height": int(self.info.get("h") or 0),

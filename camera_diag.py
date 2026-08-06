@@ -170,7 +170,11 @@ def open_device(idx):
             cap.read()
         ret, frame = cap.read()
         if ret and frame is not None and frame.mean() > 5:
+            # 带上设备名：USB 重新枚举后 index 会变，靠名字才能找回同一台相机
+            name = next((c["name"] for c in list_cameras()
+                         if str(idx) in str(c.get("instance_id", ""))), "")
             return cap, {"idx": idx, "backend": be_name, "fourcc": "MJPG",
+                         "name": name,
                          "w": int(cap.get(3)), "h": int(cap.get(4)),
                          "fps": cap.get(cv2.CAP_PROP_FPS), "mean": frame.mean()}
         cap.release()

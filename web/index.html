@@ -314,7 +314,13 @@ async function poll(){
   state.rois = s.rois; state.screens = s.screens;
   state.w = s.width || video.naturalWidth; state.h = s.height || video.naturalHeight;
 
-  $('#p-dev').textContent = `相机 ${s.device} · ${s.backend} · ${s.width}x${s.height}`;
+  // 相机掉线时明示，否则页面只是画面不动，看不出是相机没了还是设备黑屏
+  const online = s.camera_online !== false;
+  $('#p-dev').textContent = online
+    ? `相机 ${s.device} · ${s.backend} · ${s.width}x${s.height}`
+      + (s.camera_reconnects ? ` · 重连${s.camera_reconnects}次` : '')
+    : `⚠ ${s.camera_status || '相机掉线'}`;
+  $('#p-dev').className = 'pill ' + (online ? '' : 'bad');
   $('#p-fps').textContent = `${s.fps} fps`;
   const d = $('#p-detect');
   d.textContent = '检测 ' + (s.detect_on ? '开' : '关');

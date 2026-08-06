@@ -14,6 +14,171 @@
 
 ---
 
+## 从零搭一套（Ubuntu，10 分钟）
+
+面向"手上有一台 Ubuntu、一个 USB 相机、一台 Android 车机"的人，照着抄就能跑起来。
+
+### 0. 需要的东西
+
+| | 说明 |
+|---|---|
+| 主机 | Ubuntu 22.04 / 24.04，x86_64；本文在 **Ubuntu 24.04.4 + Python 3.12.3** 上验证 |
+| 相机 | 任意 UVC USB 相机即可。本文用的是 `USB2.0 Camera RGB`（`lsusb` 显示 `15aa:1555`），1280x720 MJPG 30fps |
+| 被测设备 | Android 设备，开好 USB 调试；投屏与黑屏归因要用 `adb`（没有也能跑，只是少这两个功能） |
+| 摆位 | 相机固定，能一次拍全所有待测屏幕；机位定下来后别再动 |
+
+### 1. 装系统依赖
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip git \
+                    libgl1 libglib2.0-0 \
+                    fonts-noto-cjk v4l-utils ffmpeg adb
+```
+
+| 包 | 少了会怎样 |
+|---|---|
+| `libgl1` `libglib2.0-0` | `import cv2` 报 `ImportError: libGL.so.1` |
+| `fonts-noto-cjk` | 截图上的中文变方块 |
+| `v4l-utils` | 排查相机时用不了 `v4l2-ctl` |
+| `ffmpeg` | 只有 `--finalize` 合并分段视频要用 |
+| `adb` | 没有设备投屏和黑屏归因 |
+
+### 2. 拿代码、建虚拟环境
+
+```bash
+git clone https://github.com/S10143806H/Camera-Algorithm.git
+cd Camera-Algorithm
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 3. 给权限（这一步最容易漏）
+
+```bash
+sudo usermod -aG video "$USER"     # 相机：否则打开 /dev/video* 会失败
+sudo usermod -aG plugdev "$USER"   # adb：否则设备显示 no permissions
+# 两条都需要重新登录（或重启）才生效
+```
+
+重新登录后自检：
+
+```bash
+id -nG | grep -o video               # 应输出 video
+ls -l /dev/video*                    # 应能看到设备
+adb devices                          # 应列出设备且状态为 device
+```
+
+> `adb devices` 显示 `no permissions` 时，加一条 udev 规则（`idVendor` 用 `lsusb` 里查到的值）：
+> ```bash
+> echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", GROUP="plugdev"' \
+>   | sudo tee /etc/udev/rules.d/51-android.rules
+> sudo udevadm control --reload-rules && sudo udevadm trigger
+> adb kill-server && adb devices
+> ```
+
+### 4. 先确认相机能出画
+
+```bash
+python3 camera_diag.py
+```
+
+会遍历 index × 后端 × 格式 × 分辨率，打印类似：
+
+```
+📋 系统摄像头设备 (1 个):
+  📷 USB2.0 Camera RGB: USB2.0 Camer
+     Sym: /dev/video0
+  🟢 idx=0 V4L2  fourcc=MJPG→MJPG 1280x720@30fps mean=108.6
+  ✅ 画面可用: idx=0 V4L2 MJPG 1280x720
+```
+
+**记下这个 `idx`**，下一步要用。全是 `⚫`（mean<5）说明没出画，翻最后的[故障定位](#故障定位)表。
+
+### 5. 起 Web 服务
+
+```bash
+python3 web_monitor.py --device 0 --screens 3
+```
+
+`--device` 填上一步的 idx，`--screens` 填画面里有几块屏。终端会打印访问地址：
+
+```
+✅ 相机就绪: idx=0 V4L2 1280x720
+📱 设备投屏: 已连接 <机型>，路数跟随相机屏数（当前 3）
+🌐 打开浏览器访问:  http://192.168.x.x:8000/
+```
+
+局域网内任意 PC 打开这个地址即可，被访问端不用装任何东西。
+
+### 6. 标定屏幕位置
+
+浏览器里二选一：
+
+- 点 **「自动标定」**——启动后等约 20 秒（标定缓存要攒满）再点，成功率最高
+- 点 **「框选 ROI」** 手动拖框，一块屏拖一次，最后点「应用」
+
+标定结果会存进 `screen_rois.json`，**重启自动载入，只需做一次**。网页上会给出等效命令行参数：
+
+```
+--roi 492,31,294,185;532,231,246,60;388,402,472,296
+```
+
+### 7. 验收清单
+
+| 检查项 | 期望 |
+|---|---|
+| 顶部相机标签 | 显示分辨率与 fps，**不是**红色的"相机掉线" |
+| 实时画面 | 每块屏有蓝框 + `S1/S2/S3` 编号 |
+| 屏幕状态表 | 各屏 `ok`，暗像素 0% |
+| 设备投屏 | 每块屏一格，画面与上方相机看到的对得上 |
+| 遮住某块屏 | 该屏转 `BLACK`，几秒后事件列表出现证据截图 |
+
+### 8. 常驻运行
+
+```bash
+# 后台跑，日志写文件
+setsid nohup python3 -u web_monitor.py --device 0 --screens 3 > web.log 2>&1 &
+
+# 停止（方括号防止 pkill 杀掉自己所在的 shell）
+pkill -f "[w]eb_monitor.py"
+```
+
+要开机自启就做成 systemd user 服务（`REPO` 换成实际克隆路径）：
+
+```bash
+REPO=$HOME/Camera-Algorithm
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/screen-monitor.service <<EOF
+[Unit]
+Description=Screen anomaly monitor
+[Service]
+WorkingDirectory=$REPO
+ExecStart=$REPO/.venv/bin/python -u web_monitor.py --device 0 --screens 3
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now screen-monitor
+loginctl enable-linger "$USER"      # 未登录时也保持运行
+
+systemctl --user status screen-monitor    # 看状态
+journalctl --user -u screen-monitor -f    # 跟日志
+```
+
+### 新手常踩的 5 个坑
+
+1. **加完 `video` 组没重新登录** —— 权限不生效，相机打不开。`id -nG` 里看不到 `video` 就是还没生效。
+2. **相机被别的进程占着** —— Web 服务和 `camera_diag.py` 预览不能同时开，相机只能被一个进程持有。`fuser -v /dev/video0` 查是谁。
+3. **`--device` 填错** —— USB 重新插拔后 `/dev/videoN` 会换号。服务已能自动找回（约 5 秒），但首次启动仍要填对，用 `camera_diag.py` 查。
+4. **自动标定圈成整幅画面** —— 环境太亮时白墙也会被当成屏幕。改用手动框选，或把屏幕内容切到亮画面后重标。
+5. **另一台 PC 打不开网页** —— 检查防火墙放行 8000 端口：`sudo ufw allow 8000/tcp`。先用 `curl http://<IP>:8000/api/status` 验证。
+
+---
+
 ## 命令速查
 
 ### 装环境（一次）
@@ -435,6 +600,8 @@ python3 notify/feishu_notifier.py --test
 | `C` 漏掉某块屏 | 该屏 bezel 太浅或亮度接近背景 | 用 `R` 手动补框；或把该屏内容切到亮画面后重标定 |
 | `--finalize` 报未找到 ffmpeg | 未安装 ffmpeg | `sudo apt install ffmpeg`；无 sudo 时 `pip install imageio-ffmpeg` 后将其二进制软链到 PATH |
 | Wayland 下预览窗口异常 | Qt 后端不匹配 | `export QT_QPA_PLATFORM=xcb` 后重跑 |
+| 网页画面不动、顶部标签变红 | 相机掉线（USB 重新枚举 `/dev/videoN` 换号） | 服务会自动重新枚举并找回（实测约 5 秒），无需干预；顶部标签会显示重连次数 |
+| 所有 MJPEG 流掉到 ~1fps | 相机掉线后旧版本会空转拖垮进程 | 已修（掉线自愈）；旧版本需手动重启并用正确的 `--device` |
 | `createTrackbar` 报 `NULL window handler` | 窗口句柄名含非 ASCII 字符 | Linux 的 Qt highgui 后端不支持，句柄名保持 ASCII，中文用 `cv2.setWindowTitle` 设置 |
 | Web 版报相机打不开 | 相机被 `camera_diag.py` 预览占用 | 同一时刻只能一个进程持有相机，先 `pkill -f camera_diag.py` |
 | 网页打得开但画面不动 | 防火墙放行了 80/443 未放行服务端口 | 放行该端口，或换 `--port`；`curl http://<IP>:8000/api/status` 先验证 |
