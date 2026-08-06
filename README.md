@@ -96,6 +96,7 @@ export QT_QPA_PLATFORM=xcb                         # Wayland 下预览窗口异�
 | `--adb-serial S` | `web_monitor` | 多台设备时指定序列号 |
 | `--device-displays` | `web_monitor` | 手动指定投屏的 display-id 及顺序（逗号分隔），缺省按 port 自动枚举 |
 | `--device-bitrate` | `web_monitor` | 投屏码率，默认 `4M`；分辨率按各屏原始宽高比自动缩放（长边 ≤1280） |
+| `--device-stream-mode` | `web_monitor` | `auto`（默认，串台自动降级）或 `screencap`（直接轮询，慢但从头就对） |
 | `--finalize` | `analyze_screen_*` | 合并分段视频 + 生成证据图（需 ffmpeg） |
 | `--recursive` | `analyze_black_screens` | 递归扫描 `--root` 子目录 |
 
@@ -205,10 +206,18 @@ python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 逻辑 id 与 SurfaceFlinger 的物理 id 不同，从 `DisplayViewport` 解析对应关系，
 否则输入会全部落到主屏。
 
-> **screenrecord 回落陷阱**：部分车机对某些副屏调用 `screenrecord --display-id` 会**静默回落到主屏**，
-> 把主屏的正常画面当成该副屏显示 —— 一块真正黑屏的副屏会被显示成完好，直接掩盖故障。
-> 服务在首帧后用 `screencap -d` 校验一次，亮度差超过 60 即判定回落，该屏自动切到
-> **screencap 轮询模式**（约 1–2 fps，慢但每块屏都读得对），网页上会标注 `screencap`。
+> **多路 screenrecord 串台**：实测部分车机并发跑多个 `screenrecord --display-id` 时各路会互相串台，
+> 某一路拿到的其实是另一块屏的画面（并发时甚至输出字节完全相同）。
+> 后果不只是显示错乱——一块真正黑屏的副屏会被显示成完好，**直接掩盖故障**。
+>
+> 服务用 `screencap -d` 做基准做**结构相关度**校验（降采样归一化后求相关，同屏应接近 1，
+> 串台会掉到 0.3 以下）。只比亮度抓不住这种情况：两块屏都亮时看不出差别。
+> 串台是**运行中才发生**的，所以首帧校验之外每 15 秒复检一次，连续 2 次不过才降级，
+> 避免画面变化引起误判。判定串台的那一路自动切到 **screencap 轮询**（约 1 fps，
+> 慢但每块屏都读得对），网页上标注 `screencap`，`/api/device_screen` 里带 `corr` 字段。
+>
+> 用 `--device-stream-mode screencap` 可跳过 screenrecord 直接轮询：帧率低，
+> 但从第一帧起就保证对得上，不给串台留窗口。
 
 ### HTTP 接口
 

@@ -24,11 +24,14 @@ import cv2
 import numpy as np
 
 RETRY_S = 3.0            # 设备不在 / 出错时的重试间隔
-# screenrecord 对部分副屏会静默回落到主屏（实测某车机 Rear 屏如此），
-# 于是一块真正全黑的屏会被显示成主屏的正常画面，把故障盖掉。
-# 首帧后用 screencap 校验一次：两者亮度差超过该阈值就判定回落，
-# 该屏改用 screencap 轮询（约 2fps，慢但每块屏都读得对）。
-FALLBACK_BRIGHTNESS_DIFF = 60.0
+# 并发跑多个 screenrecord 时，实测该车机各路会互相串台：某一路拿到的其实是
+# 另一块屏的画面（甚至字节完全相同）。只比亮度抓不住——两块屏都亮时看不出差别，
+# 所以改用结构相关度：把 screenrecord 帧与该屏 screencap 都降采样归一化后求相关，
+# 同一块屏应接近 1，串台时会掉到 0.3 以下。
+FALLBACK_CORR_MIN = 0.40
+FALLBACK_STRIKES = 2          # 连续几次校验不过才切，避免画面变化引起的误判
+VERIFY_INTERVAL_S = 15.0      # screenrecord 模式下周期性复检；串台是运行中才发生的，
+                              # 间隔越短，显示错误画面的窗口越小（每次仅一张 screencap 开销）
 SCREENCAP_INTERVAL_S = 0.45
 MAX_LONG_EDGE = 1280     # 投屏长边上限，按原始宽高比缩放后再送编码器
 SYNC_S = 2.0             # 管理器检查"该开几路"的间隔
@@ -186,7 +189,8 @@ def send_input(serial, logical_id, action, payload):
 class DeviceScreenService:
     """后台线程持续拉某一块显示屏，产出 JPEG 供 HTTP 取用。"""
 
-    def __init__(self, serial, display, bitrate="4M", jpeg_quality=70):
+    def __init__(self, serial, display, bitrate="4M", jpeg_quality=70,
+                 force_mode=None):
         self.serial = serial
         self.display = display              # list_displays() 的一项
         self.bitrate = bitrate
@@ -197,7 +201,11 @@ class DeviceScreenService:
         self.running = True
         self.connected = False
         self.status = "启动中"
-        self.mode = "screenrecord"      # 校验失败后切 "screencap"
+        # force_mode="screencap" 时直接用轮询，不给串台留任何窗口
+        self.mode = force_mode or "screenrecord"
+        self.force_mode = force_mode
+        self.last_corr = None           # 最近一次结构校验的相关度
+        self._strikes = 0
         self.width = self.height = 0
         self.fps = 0.0
         self._proc = None
@@ -221,7 +229,8 @@ class DeviceScreenService:
 
     def restart(self):
         """外部触发重连：回到 screenrecord 并重新校验，杀掉录制进程后主循环自动重开。"""
-        self.mode = "screenrecord"
+        self.mode = self.force_mode or "screenrecord"
+        self._strikes = 0
         self._kill_proc()
         return True
 
@@ -254,20 +263,34 @@ class DeviceScreenService:
             if self.running:
                 time.sleep(RETRY_S)
 
+    @staticmethod
+    def _signature(img, n=64):
+        """降采样 + 零均值单位方差归一化，用于跨分辨率比对画面结构。"""
+        g = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (n, n),
+                       interpolation=cv2.INTER_AREA).astype(np.float32)
+        return (g - g.mean()) / (g.std() + 1e-6)
+
     def _verify_not_fallback(self, frame):
         """用 screencap 校验 screenrecord 拿到的确实是这块屏。
 
-        返回 True 表示可信；False 表示疑似回落到主屏，调用方应改用 screencap。
+        比结构而非亮度：并发 screenrecord 串台时，两块屏可能都是亮的，
+        只看亮度分不出来；结构相关度能直接判出"这画面根本不是这块屏"。
         """
         ref = screencap_frame(self.serial, self.display["display_id"])
         if ref is None:
             return True                 # 校验不了就不误判
-        diff = abs(float(ref.mean()) - float(frame.mean()))
-        if diff <= FALLBACK_BRIGHTNESS_DIFF:
+        corr = float((self._signature(frame) * self._signature(ref)).mean())
+        with self.lock:
+            self.last_corr = round(corr, 3)
+        if corr >= FALLBACK_CORR_MIN:
+            self._strikes = 0
             return True
+        self._strikes += 1
+        if self._strikes < FALLBACK_STRIKES:
+            return True                 # 可能只是画面变化，再看一次
         print(f"⚠️ display {self.display['display_id']} ({self.display.get('name')}): "
-              f"screenrecord 画面亮度 {frame.mean():.0f} 与 screencap {ref.mean():.0f} "
-              f"相差 {diff:.0f}，判定为回落到主屏，改用 screencap 轮询")
+              f"screenrecord 画面与该屏 screencap 结构相关度仅 {corr:.2f}"
+              f"（连续 {self._strikes} 次），判定为串台/回落，改用 screencap 轮询")
         return False
 
     def _run_screencap(self, enc):
@@ -319,6 +342,7 @@ class DeviceScreenService:
             return
 
         got_first, n, t_fps = False, 0, time.time()
+        next_verify = time.time() + VERIFY_INTERVAL_S
         while self.running:
             ok, frame = cap.read()
             if not ok:
@@ -332,6 +356,14 @@ class DeviceScreenService:
                 with self.lock:
                     self.height, self.width = frame.shape[:2]
                 self._set_status("投屏中", connected=True)
+                next_verify = time.time() + VERIFY_INTERVAL_S
+            elif time.time() >= next_verify:
+                # 串台不一定一开始就发生，运行期间也要复检
+                next_verify = time.time() + VERIFY_INTERVAL_S
+                if not self._verify_not_fallback(frame):
+                    self.mode = "screencap"
+                    cap.release(); self._kill_proc()
+                    return
             ok, buf = cv2.imencode(".jpg", frame, enc)
             if ok:
                 with self.lock:
@@ -362,6 +394,7 @@ class DeviceScreenService:
                 "connected": self.connected,
                 "status": self.status,
                 "mode": self.mode,
+                "corr": self.last_corr,
                 "width": self.width,
                 "height": self.height,
                 "fps": round(self.fps, 1),
@@ -373,12 +406,13 @@ class DeviceScreenManager:
     """按相机当前能检测的屏幕数决定开几路投屏，设备增减时自动跟随。"""
 
     def __init__(self, serial=None, bitrate="4M", jpeg_quality=70,
-                 target_count=None, display_ids=None):
+                 target_count=None, display_ids=None, force_mode=None):
         self.serial = serial
         self.bitrate = bitrate
         self.jpeg_quality = jpeg_quality
         self.target_count = target_count or (lambda: 3)   # 由相机侧提供
         self.display_ids = display_ids                    # 手动指定顺序时用
+        self.force_mode = force_mode                      # None=自动，"screencap"=强制轮询
 
         self.lock = threading.Lock()
         self.services = []
@@ -474,7 +508,8 @@ class DeviceScreenManager:
             for i in range(cur, want):
                 svc = DeviceScreenService(self.active_serial, displays[i],
                                           bitrate=self.bitrate,
-                                          jpeg_quality=self.jpeg_quality)
+                                          jpeg_quality=self.jpeg_quality,
+                                          force_mode=self.force_mode)
                 svc.start()
                 with self.lock:
                     self.services.append(svc)

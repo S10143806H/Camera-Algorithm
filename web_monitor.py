@@ -581,6 +581,9 @@ def main():
                     help="手动指定投屏的 display-id 及顺序，逗号分隔；"
                          "缺省按设备 port 顺序自动枚举")
     ap.add_argument("--device-bitrate", default="4M", help="投屏码率（默认4M）")
+    ap.add_argument("--device-stream-mode", choices=("auto", "screencap"), default="auto",
+                    help="auto=先用 screenrecord 并持续校验，串台自动降级；"
+                         "screencap=直接用轮询（慢但从第一帧就保证对得上）")
     ap.add_argument("--no-device-context", action="store_true",
                     help="不采集设备状态与 logcat（默认开启，用于黑屏归因）")
     ap.add_argument("--gtmp-task", type=int, help="关联 GTMP 任务 ID，事件附带任务上下文")
@@ -623,7 +626,8 @@ def main():
             serial=args.adb_serial, bitrate=args.device_bitrate,
             target_count=camera_screen_count,
             display_ids=[d.strip() for d in args.device_displays.split(",") if d.strip()]
-                        if args.device_displays else None)
+                        if args.device_displays else None,
+            force_mode=None if args.device_stream_mode == "auto" else args.device_stream_mode)
         device_screen.start()
         serial, model = pick_device(args.adb_serial)
         print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}"
