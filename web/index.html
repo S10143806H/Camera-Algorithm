@@ -33,6 +33,13 @@
   #stage{position:relative;line-height:0;background:#000}
   #stage img{width:100%;height:auto;display:block}
   #overlay{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
+  /* 设备投屏 */
+  #dev-stage{position:relative;background:#000;min-height:180px;line-height:0}
+  #dev-video{width:100%;height:auto;display:block}
+  #dev-video:not([src]){display:none}
+  #dev-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+                   color:var(--dim);font-size:13px;line-height:1.6;text-align:center;padding:20px}
+  #dev-stage.live #dev-placeholder{display:none}
   .toolbar{display:flex;gap:8px;flex-wrap:wrap;padding:12px 14px;border-top:1px solid var(--line)}
   button{background:#232a36;color:var(--fg);border:1px solid var(--line);border-radius:7px;
          padding:7px 13px;font-size:13px;cursor:pointer}
@@ -101,6 +108,20 @@
         </div>
         <div class="hint" id="hint">
           点「框选 ROI」后在画面上拖框，每拖一次添加一块屏幕，点「应用」生效。
+        </div>
+      </div>
+    </div>
+
+    <div class="card" data-key="devscr" style="margin-top:16px">
+      <h2>设备投屏 <span class="pill" id="dev-pill">—</span><span class="chev">▾</span></h2>
+      <div class="fold">
+        <div id="dev-stage">
+          <img id="dev-video" alt="device screen">
+          <div id="dev-placeholder">等待设备画面…</div>
+        </div>
+        <div class="toolbar">
+          <button id="btn-dev-restart">重连投屏</button>
+          <span class="hint" style="padding:0;align-self:center" id="dev-status">—</span>
         </div>
       </div>
     </div>
@@ -319,6 +340,43 @@ async function pollEvents(){
   }).join('') : '<div class="empty">暂无事件</div>';
 }
 
+/* ---------- 设备投屏 ---------- */
+const devImg = $('#dev-video'), devStage = $('#dev-stage');
+let devStreamOn = false;
+
+function startDevStream(){
+  if (devStreamOn) return;
+  devStreamOn = true;
+  // 加时间戳避免浏览器复用已断开的旧连接
+  devImg.src = '/device_stream?t=' + Date.now();
+}
+devImg.addEventListener('load', () => devStage.classList.add('live'));
+devImg.addEventListener('error', () => { devStreamOn = false; devStage.classList.remove('live'); });
+
+$('#btn-dev-restart').onclick = async () => {
+  const b = $('#btn-dev-restart'); b.disabled = true;
+  try { await api('/api/device_screen/restart', 'POST'); }
+  catch (e) { alert('重连失败: ' + e.message); }
+  devStreamOn = false; devImg.removeAttribute('src'); devStage.classList.remove('live');
+  setTimeout(startDevStream, 1200);
+  b.disabled = false;
+};
+
+async function pollDevice(){
+  let d;
+  try { d = await api('/api/device_screen'); } catch { return; }
+  const pill = $('#dev-pill');
+  pill.textContent = d.connected ? `${d.model || d.serial || '设备'} · ${d.width}x${d.height} · ${d.fps}fps`
+                                 : (d.status || '未连接');
+  pill.className = 'pill ' + (d.connected ? 'ok' : 'bad');
+  $('#dev-status').textContent = d.enabled
+    ? `${d.status}${d.serial ? '　序列号 ' + d.serial : ''}`
+    : d.status;
+  if (d.connected) startDevStream();
+  else { devStage.classList.remove('live');
+         $('#dev-placeholder').textContent = d.status || '未连接设备'; }
+}
+
 /* ---------- 面板折叠（状态存 localStorage，刷新后保持） ---------- */
 const FOLD_KEY = 'cam.folded';
 function foldedSet(){
@@ -366,9 +424,10 @@ $('#events').addEventListener('click', e => {
 
 addEventListener('resize', fitCanvas);
 video.addEventListener('load', fitCanvas);
-initFolding(); refreshSelUI(); loadParams(); poll(); pollEvents();
+initFolding(); refreshSelUI(); loadParams(); poll(); pollEvents(); pollDevice();
 setInterval(poll, 1000);
 setInterval(pollEvents, 5000);
+setInterval(pollDevice, 2000);
 </script>
 </body>
 </html>

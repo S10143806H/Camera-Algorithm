@@ -4,7 +4,8 @@
 把采集 + 多屏黑屏检测跑成后台线程，通过 HTTP 对外提供：
   * MJPEG 实时画面（带 S1/S2/S3 标注与红框告警）
   * 网页内鼠标框选 ROI、一键自动标定
-  * 网页内调相机参数（亮度/对比度/增益/曝光/对焦/自动曝光）
+  * 网页内调相机参数（亮度/对比度/饱和度/增益/曝光/自动曝光）
+  * 设备投屏：adb 拉 Android 设备屏幕，显示在相机画面下方作对照
   * 事件列表与证据截图
 
 相机同一时刻只能被一个进程占用：本服务运行期间不要再开 camera_diag.py 预览。
@@ -47,6 +48,7 @@ from camera_diag import (  # noqa: E402
     parse_rois,
     run_detect_multi,
 )
+from device_screen import DeviceScreenService, pick_device  # noqa: E402
 from platform_compat import set_auto_exposure  # noqa: E402
 
 try:
@@ -301,6 +303,7 @@ class MonitorService:
 
 # ---------------------------------------------------------------- HTTP
 service: MonitorService = None
+device_screen: DeviceScreenService = None      # 设备投屏（可选，无设备时降级为"未连接"）
 server = None                     # uvicorn.Server，供 /stream 感知退出信号
 app = FastAPI(title="Screen Anomaly Monitor")
 
@@ -427,6 +430,46 @@ def api_event_shot(event_id: str):
     return FileResponse(p, media_type="image/jpeg")
 
 
+# ---------------------------------------------------------------- 设备投屏
+@app.get("/device_stream")
+async def device_stream():
+    """设备屏幕 MJPEG 流；未连接设备时输出占位帧而非 404，避免 <img> 报错。"""
+    boundary = "frame"
+
+    async def gen():
+        last = None
+        try:
+            while not _should_stop():
+                jpg = device_screen.snapshot_jpeg() if device_screen else None
+                if jpg is not None and jpg is not last:
+                    last = jpg
+                    yield (b"--" + boundary.encode() + b"\r\n"
+                           b"Content-Type: image/jpeg\r\n"
+                           b"Content-Length: " + str(len(jpg)).encode() + b"\r\n\r\n"
+                           + jpg + b"\r\n")
+                await asyncio.sleep(0.04)
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
+
+
+@app.get("/api/device_screen")
+def api_device_screen():
+    if not device_screen:
+        return {"enabled": False, "connected": False, "status": "未启用（--no-device-screen）"}
+    return {"enabled": True, **device_screen.status_dict()}
+
+
+@app.post("/api/device_screen/restart")
+def api_device_restart():
+    if not device_screen:
+        raise HTTPException(409, "设备投屏未启用")
+    device_screen.restart()
+    return {"ok": True}
+
+
 @app.get("/api/snapshot")
 def api_snapshot():
     """当前帧单张 JPEG，便于外部脚本抓图或做健康检查。"""
@@ -438,7 +481,7 @@ def api_snapshot():
 
 # ---------------------------------------------------------------- main
 def main():
-    global service
+    global service, device_screen
     ap = argparse.ArgumentParser(description="屏幕异常实时监控 Web 服务")
     ap.add_argument("--device", type=int, default=None, help="相机 index，缺省则自动诊断")
     ap.add_argument("--screens", type=int, default=3, help="最多识别几块屏幕（默认3）")
@@ -448,6 +491,11 @@ def main():
     ap.add_argument("--no-detect", action="store_true", help="只看画面，不做检测")
     ap.add_argument("--notify", action="store_true", help="事件推送飞书（需 FEISHU_WEBHOOK）")
     ap.add_argument("--quality", type=int, default=75, help="MJPEG 质量 1-100（默认75）")
+    ap.add_argument("--no-device-screen", action="store_true",
+                    help="不启用 Android 设备投屏（默认自动探测 adb 设备）")
+    ap.add_argument("--adb-serial", help="指定 adb 设备序列号（多台设备时）")
+    ap.add_argument("--device-size", default="1280x800", help="投屏分辨率（默认1280x800）")
+    ap.add_argument("--device-bitrate", default="4M", help="投屏码率（默认4M）")
     args = ap.parse_args()
 
     opened = open_device(args.device) if args.device is not None else diagnose_all()
@@ -476,6 +524,13 @@ def main():
                              jpeg_quality=args.quality)
     service.start()
 
+    if not args.no_device_screen:
+        device_screen = DeviceScreenService(serial=args.adb_serial, size=args.device_size,
+                                            bitrate=args.device_bitrate)
+        device_screen.start()
+        serial, model = pick_device(args.adb_serial)
+        print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}")
+
     import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -495,6 +550,8 @@ def main():
         server.run()
     finally:
         service.stop()
+        if device_screen:
+            device_screen.stop()
     return 0
 
 

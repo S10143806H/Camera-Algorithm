@@ -2,7 +2,7 @@
 USB2.0 摄像头诊断 + 黑屏检测预览工具
 ====================================
 1. 摄像头诊断：强制 MJPG 四字节码 + 遍历 backend/fourcc/分辨率，解决"打开了却黑屏"。
-2. 参数调节：预览窗口带滑动条（亮度/对比度/饱和度/增益/曝光/自动曝光/对焦）。
+2. 参数调节：预览窗口带滑动条（亮度/对比度/饱和度/增益/曝光/自动曝光）。
 3. 黑屏检测：--detect 开启，复用 analyze_black_screens.detect_dark_region，
    在预览中用红色高亮框圈出检测到的黑屏区域，橙框为标定的屏幕 ROI。
 
@@ -35,9 +35,8 @@ USB2.0 摄像头诊断 + 黑屏检测预览工具
      使黑屏帧亮度漂移，是误报/漏报的第一来源，务必关掉后固定 Exposure。
   2. Gain 固定低增益 —— 高增益噪点会抬高暗区灰度和边缘密度，干扰 P1 规则。
   3. 白平衡锁定（部分相机需在厂商工具中关 AWB）。
-  4. Focus 手动锁定 —— 失焦会模糊 pane 边界。
-  5. ROI 固定 —— 台架机位固定后用 C 标定一次，抄下坐标写入 --roi。
-  6. 分辨率/FOURCC：MJPG ≥720p；Brightness/Contrast 保持驱动默认居中值。
+  4. ROI 固定 —— 台架机位固定后用 C 标定一次，抄下坐标写入 --roi。
+  5. 分辨率/FOURCC：MJPG ≥720p；Brightness/Contrast 保持驱动默认居中值。
 """
 
 import argparse
@@ -125,7 +124,6 @@ CAM_PARAMS = [
     ("Saturation",  cv2.CAP_PROP_SATURATION,    255, lambda v: v),
     ("Gain",        cv2.CAP_PROP_GAIN,          255, lambda v: v),
     ("Exposure -n", cv2.CAP_PROP_EXPOSURE,       13, lambda v: -v),
-    ("Focus",       cv2.CAP_PROP_FOCUS,         255, lambda v: v),
 ]
 
 
