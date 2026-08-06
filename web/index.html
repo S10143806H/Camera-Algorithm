@@ -414,8 +414,10 @@ async function pollDevice(){
   screens.forEach(s => {
     const cell = devGrid.querySelector(`.dev-cell[data-i="${s.index}"]`);
     if (!cell) return;
+    // screencap 模式说明该屏的 screenrecord 回落到了主屏，标出来免得以为是卡顿
+    const mode = s.mode === 'screencap' ? ' · screencap' : '';
     cell.querySelector('[data-rt]').textContent =
-      s.connected ? `${s.width}x${s.height} · ${s.fps}fps` : s.status;
+      s.connected ? `${s.width}x${s.height} · ${s.fps}fps${mode}` : s.status;
     if (!s.connected) cell.querySelector('.dev-shot').classList.remove('live');
     cell.querySelector('.ph').textContent = s.status;
   });

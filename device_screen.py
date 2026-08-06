@@ -21,8 +21,15 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 RETRY_S = 3.0            # 设备不在 / 出错时的重试间隔
+# screenrecord 对部分副屏会静默回落到主屏（实测某车机 Rear 屏如此），
+# 于是一块真正全黑的屏会被显示成主屏的正常画面，把故障盖掉。
+# 首帧后用 screencap 校验一次：两者亮度差超过该阈值就判定回落，
+# 该屏改用 screencap 轮询（约 2fps，慢但每块屏都读得对）。
+FALLBACK_BRIGHTNESS_DIFF = 60.0
+SCREENCAP_INTERVAL_S = 0.45
 MAX_LONG_EDGE = 1280     # 投屏长边上限，按原始宽高比缩放后再送编码器
 SYNC_S = 2.0             # 管理器检查"该开几路"的间隔
 
@@ -95,6 +102,24 @@ def list_displays(serial=None):
     return displays
 
 
+def screencap_frame(serial, display_id, timeout=20):
+    """用 screencap 抓某块屏的单帧（BGR ndarray）。失败返回 None。
+
+    screencap 按 display-id 逐屏读取始终正确，是校验 screenrecord 的基准。
+    """
+    try:
+        raw = subprocess.check_output(
+            ["adb"] + (["-s", serial] if serial else []) +
+            ["exec-out", "screencap", "-d", str(display_id), "-p"],
+            timeout=timeout, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    i = raw.find(b"\x89PNG")          # 部分机型会在 PNG 前打印告警
+    if i < 0:
+        return None
+    return cv2.imdecode(np.frombuffer(raw[i:], np.uint8), cv2.IMREAD_COLOR)
+
+
 def scaled_size(width, height, long_edge=MAX_LONG_EDGE):
     """按原始宽高比缩到长边不超过 long_edge，并对齐到偶数（AVC 编码器要求）。
 
@@ -123,6 +148,7 @@ class DeviceScreenService:
         self.running = True
         self.connected = False
         self.status = "启动中"
+        self.mode = "screenrecord"      # 校验失败后切 "screencap"
         self.width = self.height = 0
         self.fps = 0.0
         self._proc = None
@@ -145,7 +171,8 @@ class DeviceScreenService:
             return self._jpeg
 
     def restart(self):
-        """外部触发重连：杀掉录制进程，主循环自动重开。"""
+        """外部触发重连：回到 screenrecord 并重新校验，杀掉录制进程后主循环自动重开。"""
+        self.mode = "screenrecord"
         self._kill_proc()
         return True
 
@@ -169,11 +196,57 @@ class DeviceScreenService:
         enc = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         while self.running:
             try:
-                self._run_once(enc)
+                if self.mode == "screencap":
+                    self._run_screencap(enc)
+                else:
+                    self._run_once(enc)
             except Exception as e:
                 self._set_status(f"投屏出错: {e}", connected=False)
             if self.running:
                 time.sleep(RETRY_S)
+
+    def _verify_not_fallback(self, frame):
+        """用 screencap 校验 screenrecord 拿到的确实是这块屏。
+
+        返回 True 表示可信；False 表示疑似回落到主屏，调用方应改用 screencap。
+        """
+        ref = screencap_frame(self.serial, self.display["display_id"])
+        if ref is None:
+            return True                 # 校验不了就不误判
+        diff = abs(float(ref.mean()) - float(frame.mean()))
+        if diff <= FALLBACK_BRIGHTNESS_DIFF:
+            return True
+        print(f"⚠️ display {self.display['display_id']} ({self.display.get('name')}): "
+              f"screenrecord 画面亮度 {frame.mean():.0f} 与 screencap {ref.mean():.0f} "
+              f"相差 {diff:.0f}，判定为回落到主屏，改用 screencap 轮询")
+        return False
+
+    def _run_screencap(self, enc):
+        """screencap 轮询模式：帧率低但每块屏都读得对。"""
+        self._set_status("投屏中（screencap 模式）", connected=True)
+        n, t_fps = 0, time.time()
+        while self.running:
+            frame = screencap_frame(self.serial, self.display["display_id"])
+            if frame is None:
+                self._set_status("screencap 抓图失败", connected=False)
+                return
+            size = scaled_size(frame.shape[1], frame.shape[0])
+            if size:
+                w, h = (int(v) for v in size.split("x"))
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            with self.lock:
+                self.height, self.width = frame.shape[:2]
+            ok, buf = cv2.imencode(".jpg", frame, enc)
+            if ok:
+                with self.lock:
+                    self._jpeg = buf.tobytes()
+            n += 1
+            now = time.time()
+            if now - t_fps >= 1.0:
+                with self.lock:
+                    self.fps = n / (now - t_fps)
+                n, t_fps = 0, now
+            time.sleep(SCREENCAP_INTERVAL_S)
 
     def _run_once(self, enc):
         if self._fifo.exists():
@@ -203,6 +276,10 @@ class DeviceScreenService:
                 break
             if not got_first:
                 got_first = True
+                if not self._verify_not_fallback(frame):
+                    self.mode = "screencap"
+                    cap.release(); self._kill_proc()
+                    return
                 with self.lock:
                     self.height, self.width = frame.shape[:2]
                 self._set_status("投屏中", connected=True)
@@ -231,6 +308,7 @@ class DeviceScreenService:
                 "native": f"{self.display.get('width')}x{self.display.get('height')}",
                 "connected": self.connected,
                 "status": self.status,
+                "mode": self.mode,
                 "width": self.width,
                 "height": self.height,
                 "fps": round(self.fps, 1),
