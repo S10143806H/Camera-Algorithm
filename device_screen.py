@@ -83,7 +83,8 @@ def list_displays(serial=None):
     for m in re.finditer(r"^Display (\d+) \(HWC display \d+\): port=(\d+).*?displayName=\"([^\"]*)\"",
                          sf, re.M):
         displays.append({"display_id": m.group(1), "port": int(m.group(2)),
-                         "name": m.group(3), "width": 0, "height": 0})
+                         "name": m.group(3), "width": 0, "height": 0,
+                         "logical_id": None})
     if not displays:
         return []
 
@@ -95,6 +96,12 @@ def list_displays(serial=None):
             for d in displays:
                 if d["display_id"] == did:
                     d["name"], d["width"], d["height"] = name, w, h
+        # input/am 用的是逻辑 displayId（0/1/2），与 SurfaceFlinger 的物理 id 不同，
+        # 从 DisplayViewport 里把两者对上，否则输入会全部落到主屏
+        for m in re.finditer(r"displayId=(\d+), uniqueId='local:(\d+)'", dd):
+            for d in displays:
+                if d["display_id"] == m.group(2):
+                    d["logical_id"] = int(m.group(1))
     except Exception:
         pass
 
@@ -131,6 +138,48 @@ def scaled_size(width, height, long_edge=MAX_LONG_EDGE):
     w = max(16, int(width * scale) // 2 * 2)
     h = max(16, int(height * scale) // 2 * 2)
     return f"{w}x{h}"
+
+
+# ---------------------------------------------------------------- 输入回传
+KEYCODES = {
+    "HOME": "KEYCODE_HOME", "BACK": "KEYCODE_BACK", "MENU": "KEYCODE_MENU",
+    "POWER": "KEYCODE_POWER", "ENTER": "KEYCODE_ENTER", "DEL": "KEYCODE_DEL",
+    "VOLUME_UP": "KEYCODE_VOLUME_UP", "VOLUME_DOWN": "KEYCODE_VOLUME_DOWN",
+    "APP_SWITCH": "KEYCODE_APP_SWITCH", "WAKEUP": "KEYCODE_WAKEUP",
+}
+
+
+def send_input(serial, logical_id, action, payload):
+    """把浏览器里的操作转成 adb input 打到指定屏。
+
+    坐标以归一化 0~1 传入，再乘该屏原生宽高——浏览器里画面是缩放显示的，
+    直接传像素会错位。logical_id 为 None 时不带 -d，落到主屏。
+    """
+    if logical_id is None and action in ("tap", "swipe"):
+        raise ValueError("该屏没有解析到逻辑 displayId，无法定向注入输入")
+    base = ["adb"] + (["-s", serial] if serial else []) + ["shell", "input"]
+    if logical_id is not None:
+        base += ["-d", str(logical_id)]
+
+    if action == "tap":
+        cmd = base + ["tap", str(payload["x"]), str(payload["y"])]
+    elif action == "swipe":
+        cmd = base + ["swipe", str(payload["x1"]), str(payload["y1"]),
+                      str(payload["x2"]), str(payload["y2"]),
+                      str(int(payload.get("duration_ms", 200)))]
+    elif action == "key":
+        name = str(payload.get("key", "")).upper()
+        cmd = base + ["keyevent", KEYCODES.get(name, name)]
+    elif action == "text":
+        # input text 不接受空格与部分符号，转义后再发
+        txt = str(payload.get("text", "")).replace(" ", "%s")
+        cmd = base + ["text", txt]
+    else:
+        raise ValueError(f"不支持的操作: {action}")
+
+    subprocess.run(cmd, timeout=20, check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return " ".join(cmd[-4:])
 
 
 # ---------------------------------------------------------------- 单屏投屏
@@ -306,6 +355,10 @@ class DeviceScreenService:
                 "port": self.display.get("port"),
                 "name": self.display.get("name") or f"Display {self.display.get('port')}",
                 "native": f"{self.display.get('width')}x{self.display.get('height')}",
+                "native_w": self.display.get("width"),
+                "native_h": self.display.get("height"),
+                "logical_id": self.display.get("logical_id"),
+                "can_input": self.display.get("logical_id") is not None,
                 "connected": self.connected,
                 "status": self.status,
                 "mode": self.mode,

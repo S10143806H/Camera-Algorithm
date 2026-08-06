@@ -128,8 +128,16 @@
       <div class="fold">
         <div id="dev-grid"><div class="empty">等待设备…</div></div>
         <div class="toolbar">
+          <button id="btn-dev-ctrl">控制：关</button>
+          <button id="btn-key-home" disabled>HOME</button>
+          <button id="btn-key-back" disabled>BACK</button>
+          <button id="btn-key-power" disabled>POWER</button>
           <button id="btn-dev-restart">重连投屏</button>
           <span class="hint" style="padding:0;align-self:center" id="dev-status">—</span>
+        </div>
+        <div class="hint" id="dev-ctrl-hint">
+          控制关闭时点画面是看大图。打开后：单击=点按 · 拖动=滑动 · 键盘输入=发文字，
+          回车/退格发对应按键；按键按钮作用于最后一次点击过的那块屏。
         </div>
       </div>
     </div>
@@ -358,7 +366,7 @@ function buildDevGrid(screens){
     <div class="dev-cell" data-i="${s.index}">
       <div class="cap">
         <span class="sn">D${s.index + 1}</span>
-        <span class="nm">${s.name}</span>
+        <span class="nm">${s.name}</span>${s.can_input ? '' : '<span title="该屏未解析到逻辑 displayId，无法注入输入">🚫</span>'}
         <span class="rt" data-rt>—</span>
       </div>
       <div class="dev-shot">
@@ -372,6 +380,7 @@ function buildDevGrid(screens){
     img.addEventListener('load', () => shot.classList.add('live'));
     img.addEventListener('error', () => shot.classList.remove('live'));
     img.src = `/device_stream/${cell.dataset.i}?t=${Date.now()}`;
+    img.style.cursor = devCtrl ? 'crosshair' : 'zoom-in';
   });
 }
 
@@ -383,10 +392,67 @@ $('#btn-dev-restart').onclick = async () => {
   b.disabled = false;
 };
 
-// 投屏画面同样点开看大图（MJPEG 帧可直接作为图片源）
+/* ---------- 输入回传：浏览器操作 -> adb input ---------- */
+let devCtrl = false, lastCtrlIdx = 0, press = null;
+
+function setCtrl(on){
+  devCtrl = on;
+  $('#btn-dev-ctrl').textContent = '控制：' + (on ? '开' : '关');
+  $('#btn-dev-ctrl').classList.toggle('primary', on);
+  ['home','back','power'].forEach(k => $('#btn-key-' + k).disabled = !on);
+  devGrid.querySelectorAll('.dev-shot img').forEach(
+    i => i.style.cursor = on ? 'crosshair' : 'zoom-in');
+}
+$('#btn-dev-ctrl').onclick = () => setCtrl(!devCtrl);
+
+async function sendInput(idx, body){
+  try { return await api(`/api/device_screen/${idx}/input`, 'POST', body); }
+  catch (e) { $('#dev-status').textContent = '注入失败: ' + e.message; }
+}
+// 坐标归一化：画面在浏览器里是缩放显示的，按比例传 0~1，服务端再乘原生分辨率
+function normPos(img, ev){
+  const r = img.getBoundingClientRect();
+  return {x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height};
+}
+
+devGrid.addEventListener('pointerdown', e => {
+  const img = e.target.closest('.dev-shot img');
+  if (!img || !devCtrl) return;
+  lastCtrlIdx = +img.closest('.dev-cell').dataset.i;
+  press = {t: Date.now(), ...normPos(img, e), img, idx: lastCtrlIdx};
+  e.preventDefault();               // 阻止图片被浏览器当成可拖拽对象
+});
+// 收笔监听挂在 window 上：拖到画面外松手也算数，且不依赖 pointer capture
+addEventListener('pointerup', e => {
+  if (!devCtrl || !press) return;
+  const p = normPos(press.img, e);
+  const moved = Math.hypot(p.x - press.x, p.y - press.y);
+  // 位移超过画面 2% 视为滑动，否则按点按
+  if (moved > 0.02)
+    sendInput(press.idx, {action: 'swipe', x: press.x, y: press.y, x2: p.x, y2: p.y,
+                          duration_ms: Math.max(80, Math.min(1200, Date.now() - press.t))});
+  else
+    sendInput(press.idx, {action: 'tap', x: p.x, y: p.y});
+  press = null;
+});
+
+['home','back','power'].forEach(k => {
+  $('#btn-key-' + k).onclick = () => sendInput(lastCtrlIdx, {action: 'key', key: k.toUpperCase()});
+});
+
+// 控制打开时键盘直接发到设备（灯箱打开或在输入框里时不拦截）
+addEventListener('keydown', e => {
+  if (!devCtrl || !lb.hidden) return;
+  if (e.target.matches('input, textarea')) return;
+  if (e.key === 'Enter')        { sendInput(lastCtrlIdx, {action:'key', key:'ENTER'}); e.preventDefault(); }
+  else if (e.key === 'Backspace'){ sendInput(lastCtrlIdx, {action:'key', key:'DEL'}); e.preventDefault(); }
+  else if (e.key.length === 1)  { sendInput(lastCtrlIdx, {action:'text', text:e.key}); e.preventDefault(); }
+});
+
+// 控制关闭时，点画面还是看大图
 devGrid.addEventListener('click', e => {
   const img = e.target.closest('.dev-shot img');
-  if (!img || !img.getAttribute('src')) return;
+  if (!img || devCtrl || !img.getAttribute('src')) return;
   const cell = img.closest('.dev-cell');
   openLightbox(img.src, cell.querySelector('.nm').textContent,
                cell.querySelector('[data-rt]').textContent);

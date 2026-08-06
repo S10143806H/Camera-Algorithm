@@ -50,7 +50,7 @@ from camera_diag import (  # noqa: E402
     run_detect_multi,
 )
 from device_context import DeviceContext  # noqa: E402
-from device_screen import DeviceScreenManager, pick_device  # noqa: E402
+from device_screen import DeviceScreenManager, pick_device, send_input  # noqa: E402
 from gtmp_link import GtmpLink  # noqa: E402
 from platform_compat import set_auto_exposure  # noqa: E402
 
@@ -366,6 +366,17 @@ class DetectIn(BaseModel):
     on: bool
 
 
+class InputIn(BaseModel):
+    action: str                       # tap / swipe / key / text
+    x: float = None                   # 归一化 0~1，浏览器画面是缩放的
+    y: float = None
+    x2: float = None
+    y2: float = None
+    duration_ms: int = 200
+    key: str = None
+    text: str = None
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return (ROOT / "web" / "index.html").read_text(encoding="utf-8")
@@ -495,6 +506,41 @@ def api_device_restart():
     if not device_screen:
         raise HTTPException(409, "设备投屏未启用")
     return {"ok": True, "restarted": device_screen.restart_all()}
+
+
+@app.post("/api/device_screen/{index}/input")
+def api_device_input(index: int, body: InputIn):
+    """把浏览器里的点击/滑动/按键打到对应那块设备屏。"""
+    if not (device_screen and device_screen.get(index)):
+        raise HTTPException(404, f"第 {index + 1} 路投屏不存在")
+    svc = device_screen.get(index)
+    d = svc.display
+    lid, nw, nh = d.get("logical_id"), d.get("width") or 0, d.get("height") or 0
+    if lid is None:
+        raise HTTPException(409, f"{d.get('name')} 未解析到逻辑 displayId，无法注入输入")
+
+    def px(v, span):
+        return int(max(0, min(1.0, float(v))) * span)
+
+    try:
+        if body.action == "tap":
+            payload = {"x": px(body.x, nw), "y": px(body.y, nh)}
+        elif body.action == "swipe":
+            payload = {"x1": px(body.x, nw), "y1": px(body.y, nh),
+                       "x2": px(body.x2, nw), "y2": px(body.y2, nh),
+                       "duration_ms": body.duration_ms}
+        elif body.action == "key":
+            payload = {"key": body.key}
+        elif body.action == "text":
+            payload = {"text": body.text}
+        else:
+            raise HTTPException(400, f"不支持的操作: {body.action}")
+        cmd = send_input(device_screen.active_serial, lid, body.action, payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"注入失败: {e}")
+    return {"ok": True, "display": d.get("name"), "logical_id": lid, "sent": cmd}
 
 
 @app.get("/api/device_context")

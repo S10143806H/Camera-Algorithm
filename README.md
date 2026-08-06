@@ -188,6 +188,22 @@ python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 | 设备掉线 | 退到"未连接"并每 3 秒重试，插回后自动恢复，不影响相机检测 |
 | 看大图 | 点任一路投屏画面可放大查看 |
 | 手动重连 | 网页上点「重连投屏」（会重新做一次回落校验） |
+| 远程操作 | 打开「控制」后可直接在网页上操作设备，见下 |
+
+**远程操作**：投屏面板的「控制」按钮默认**关**——关闭时点画面是看大图，避免看监控时误触设备。
+打开后：
+
+| 操作 | 效果 |
+|---|---|
+| 单击画面 | `input tap` 点按 |
+| 拖动画面 | `input swipe` 滑动（位移超过画面 2% 才算滑动） |
+| 键盘打字 | `input text`；回车 / 退格发 `KEYCODE_ENTER` / `KEYCODE_DEL` |
+| HOME / BACK / POWER 按钮 | 对应 keyevent，作用于最后点击过的那块屏 |
+
+坐标以归一化 0~1 传给服务端，再乘该屏**原生分辨率** —— 浏览器里画面是缩放显示的，
+直传像素会错位。输入用 `input -d <逻辑displayId>` 定向到指定屏；
+逻辑 id 与 SurfaceFlinger 的物理 id 不同，从 `DisplayViewport` 解析对应关系，
+否则输入会全部落到主屏。
 
 > **screenrecord 回落陷阱**：部分车机对某些副屏调用 `screenrecord --display-id` 会**静默回落到主屏**，
 > 把主屏的正常画面当成该副屏显示 —— 一块真正黑屏的副屏会被显示成完好，直接掩盖故障。
@@ -210,6 +226,7 @@ python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 | GET | `/device_stream/{i}` | 第 i 块设备屏的 MJPEG 流（i 从 0 起） |
 | GET | `/api/device_screen` | 投屏状态（设备、物理屏列表、每路分辨率与 fps） |
 | POST | `/api/device_screen/restart` | 重连投屏 |
+| POST | `/api/device_screen/{i}/input` | 向第 i 块设备屏注入 tap / swipe / key / text |
 
 停止服务：
 
