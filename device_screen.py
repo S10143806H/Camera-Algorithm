@@ -432,7 +432,13 @@ class DeviceScreenService:
 
 # ---------------------------------------------------------------- 多屏管理
 class DeviceScreenManager:
-    """按相机当前能检测的屏幕数决定开几路投屏，设备增减时自动跟随。"""
+    """同一时刻只投一块屏，可在网页上切换。
+
+    早先是三块屏同时投。代价有两层：并发 screenrecord 会串台（该车机三路必串、
+    两路才可用），且三路 H.264 解码 + JPEG 编码同时跑会压低所有流的帧率。
+    改成单路后既绕开串台，任意一块屏都能独占 screenrecord 跑满帧率，
+    未选中的屏完全不采集，不占设备与主机资源。
+    """
 
     def __init__(self, serial=None, bitrate="4M", jpeg_quality=70,
                  target_count=None, display_ids=None, force_mode=None,
@@ -446,7 +452,8 @@ class DeviceScreenManager:
         self.record_max = max(0, int(record_max))         # 同时跑 screenrecord 的路数上限
 
         self.lock = threading.Lock()
-        self.services = []
+        self.service = None          # 当前唯一在跑的那一路
+        self.active = 0              # 选中的屏序号（displays 的下标）
         self.displays = []
         self.active_serial = None
         self.model = ""
@@ -459,35 +466,55 @@ class DeviceScreenManager:
 
     def stop(self):
         self.running = False
-        with self.lock:
-            svcs, self.services = self.services, []
-        for s in svcs:
-            s.stop()
+        svc = self._take_service()
+        if svc:
+            svc.stop()
         self._thread.join(timeout=5)
 
-    def get(self, index):
+    def _take_service(self):
         with self.lock:
-            return self.services[index] if 0 <= index < len(self.services) else None
+            svc, self.service = self.service, None
+        return svc
+
+    def get(self, index=None):
+        """取当前在跑的那一路；index 与当前选中不一致时返回 None。"""
+        with self.lock:
+            if index is None or index == self.active:
+                return self.service
+            return None
+
+    def select(self, index):
+        """切换到第 index 块屏；只有它会被采集。"""
+        with self.lock:
+            n = len(self.displays)
+            if not (0 <= index < n):
+                raise ValueError(f"屏幕序号超范围: {index}（共 {n} 块）")
+            if index == self.active and self.service is not None:
+                return index
+            self.active = index
+        svc = self._take_service()          # 先停旧的，避免两路并发串台
+        if svc:
+            svc.stop()
+        return index
 
     def restart_all(self):
-        with self.lock:
-            svcs = list(self.services)
-        for s in svcs:
-            s.restart()
-        return len(svcs)
+        svc = self.get()
+        if svc:
+            svc.restart()
+        return 1 if svc else 0
 
     def _stop_all(self, note):
         with self.lock:
-            svcs, self.services = self.services, []
             self.status = note
-        for s in svcs:
+        svcs = [self._take_service()]
+        for s in [x for x in svcs if x]:
             s.stop()
 
     def _loop(self):
         while self.running:
             serial, model = pick_device(self.serial)
             if not serial:
-                if self.services:
+                if self.service is not None:
                     self._stop_all("未连接设备（adb devices 为空）")
                 else:
                     with self.lock:
@@ -516,52 +543,55 @@ class DeviceScreenManager:
             time.sleep(SYNC_S)
 
     def _sync(self):
-        """把投屏路数对齐到 min(设备屏数, 相机能检测的屏数)。"""
-        try:
-            want = int(self.target_count())
-        except Exception:
-            want = len(self.displays)
+        """保证选中的那一块屏正在采集，且只有它在采集。"""
         with self.lock:
             displays = list(self.displays)
-            cur = len(self.services)
-        want = max(0, min(want, len(displays)))
-        if want == cur:
+            active = self.active
+            svc = self.service
+        if not displays:
+            return
+        if active >= len(displays):       # 屏数变少（换设备）时把选择夹回来
+            active = 0
             with self.lock:
-                self.status = f"投屏 {cur}/{len(displays)} 块屏"
+                self.active = 0
+
+        want_id = displays[active]["display_id"]
+        if svc is not None and svc.display["display_id"] == want_id:
+            with self.lock:
+                self.status = f"投屏 D{active + 1} {displays[active].get('name')}"
             return
 
-        if want < cur:                    # 相机侧屏数减少：关掉多余的
-            with self.lock:
-                extra, self.services = self.services[want:], self.services[:want]
-            for s in extra:
-                s.stop()
-        else:                             # 增加：为新的显示屏开流
-            for i in range(cur, want):
-                # 前 record_max 路用 screenrecord，其余直接 screencap：
-                # 与其让它们并发串台再被校验降级（期间画面是错的），不如一开始就分配好
-                mode = self.force_mode or (None if i < self.record_max else "screencap")
-                svc = DeviceScreenService(self.active_serial, displays[i],
-                                          bitrate=self.bitrate,
-                                          jpeg_quality=self.jpeg_quality,
-                                          force_mode=mode,
-                                          siblings=displays)
-                svc.start()
-                with self.lock:
-                    self.services.append(svc)
+        if svc is not None:               # 选择变了：先停旧的再开新的，全程只有一路
+            self._take_service()
+            svc.stop()
+
+        new_svc = DeviceScreenService(self.active_serial, displays[active],
+                                      bitrate=self.bitrate,
+                                      jpeg_quality=self.jpeg_quality,
+                                      force_mode=self.force_mode,
+                                      siblings=displays)
+        new_svc.start()
         with self.lock:
-            self.status = f"投屏 {len(self.services)}/{len(displays)} 块屏"
+            self.service = new_svc
+            self.status = f"投屏 D{active + 1} {displays[active].get('name')}"
 
     def status_dict(self):
         with self.lock:
-            svcs = list(self.services)
+            svc, active = self.service, self.active
             base = {
                 "available": bool(shutil.which("adb")),
                 "serial": self.active_serial,
                 "model": self.model,
                 "status": self.status,
+                "active": active,
                 "display_count": len(self.displays),
-                "displays": [dict(d) for d in self.displays],
+                # 可选列表给网页画切换按钮；只有 active 那一路真在采集
+                "displays": [{"index": i, "name": d.get("name") or f"Display {i+1}",
+                              "display_id": d["display_id"],
+                              "native": f"{d.get('width')}x{d.get('height')}"}
+                             for i, d in enumerate(self.displays)],
             }
-        base["screens"] = [s.status_dict(i) for i, s in enumerate(svcs)]
-        base["connected"] = any(s["connected"] for s in base["screens"])
+        base["screen"] = svc.status_dict(active) if svc else None
+        base["screens"] = [base["screen"]] if base["screen"] else []
+        base["connected"] = bool(base["screen"] and base["screen"]["connected"])
         return base

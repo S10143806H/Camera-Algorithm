@@ -34,11 +34,11 @@
   #stage img{width:100%;height:auto;display:block}
   #overlay{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
   /* 设备投屏：一块屏一格，格数跟随相机能检测的屏幕数 */
-  #dev-grid{display:grid;gap:10px;padding:10px}
-  #dev-grid.n1{grid-template-columns:1fr}
-  #dev-grid.n2{grid-template-columns:repeat(2,1fr)}
-  #dev-grid.n3{grid-template-columns:repeat(3,1fr)}
-  @media(max-width:900px){#dev-grid.n2,#dev-grid.n3{grid-template-columns:1fr}}
+  #dev-grid{padding:10px}
+  .dev-pick{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .dev-pick .pick{font-size:12px;padding:5px 11px}
+  .dev-pick .pick.on{background:var(--accent);border-color:var(--accent);
+                     color:#04121e;font-weight:600}
   .dev-cell{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:#000}
   .dev-cell .cap{display:flex;align-items:center;gap:8px;padding:6px 10px;
                  background:#232a36;font-size:12px;color:var(--dim);line-height:1.4}
@@ -375,31 +375,44 @@ async function pollEvents(){
   }).join('') : '<div class="empty">暂无事件</div>';
 }
 
-/* ---------- 设备投屏（多屏，格数跟随相机屏数） ---------- */
+/* ---------- 设备投屏（同一时刻只投一块，可切换） ---------- */
 const devGrid = $('#dev-grid');
-let devCount = -1;                 // 当前已建的格子数，仅在变化时重建 DOM
+let devActive = -1, devKey = '';
 
-function buildDevGrid(screens){
-  devGrid.className = 'n' + Math.min(3, Math.max(1, screens.length));
-  devGrid.innerHTML = screens.map(s => `
-    <div class="dev-cell" data-i="${s.index}">
+function buildDevView(d){
+  const list = d.displays || [];
+  const act = d.active ?? 0;
+  devGrid.className = 'single';
+  devGrid.innerHTML = `
+    <div class="dev-pick">${list.map(x => `
+      <button class="pick ${x.index === act ? 'on' : ''}" data-i="${x.index}"
+              title="${x.native || ''}">D${x.index + 1} ${x.name}</button>`).join('')}
+    </div>
+    <div class="dev-cell" data-i="${act}">
       <div class="cap">
-        <span class="sn">D${s.index + 1}</span>
-        <span class="nm">${s.name}</span>${s.can_input ? '' : '<span title="该屏未解析到逻辑 displayId，无法注入输入">🚫</span>'}
+        <span class="sn">D${act + 1}</span>
+        <span class="nm">${(list[act] || {}).name || ''}</span>
         <span class="rt" data-rt>—</span>
       </div>
       <div class="dev-shot">
-        <img alt="${s.name}" title="点击查看大图">
-        <div class="ph">连接中…</div>
+        <img alt="device" title="点击查看大图">
+        <div class="ph">连接中…（切换后约 5 秒出画）</div>
       </div>
-    </div>`).join('');
-  // MJPEG 流一格一条长连接，只在重建时挂 src，避免每次轮询都重连
-  devGrid.querySelectorAll('.dev-cell').forEach(cell => {
-    const img = cell.querySelector('img'), shot = cell.querySelector('.dev-shot');
-    img.addEventListener('load', () => shot.classList.add('live'));
-    img.addEventListener('error', () => shot.classList.remove('live'));
-    img.src = `/device_stream/${cell.dataset.i}?t=${Date.now()}`;
-    img.style.cursor = devCtrl ? 'crosshair' : 'zoom-in';
+    </div>`;
+  const cell = devGrid.querySelector('.dev-cell');
+  const img = cell.querySelector('img'), shot = cell.querySelector('.dev-shot');
+  img.addEventListener('load', () => shot.classList.add('live'));
+  img.addEventListener('error', () => shot.classList.remove('live'));
+  img.src = `/device_stream/${act}?t=${Date.now()}`;
+  img.style.cursor = devCtrl ? 'crosshair' : 'zoom-in';
+  lastCtrlIdx = act;                  // 按键作用于当前这块屏
+  devGrid.querySelectorAll('button.pick').forEach(b => {
+    b.onclick = async () => {
+      devGrid.querySelectorAll('button.pick').forEach(x => x.disabled = true);
+      try { await api('/api/device_screen/select', 'POST', {index: +b.dataset.i}); }
+      catch (e) { alert('切换失败: ' + e.message); }
+      devKey = '';                      // 强制下次轮询重建
+    };
   });
 }
 
@@ -407,11 +420,9 @@ $('#btn-dev-restart').onclick = async () => {
   const b = $('#btn-dev-restart'); b.disabled = true;
   try { await api('/api/device_screen/restart', 'POST'); }
   catch (e) { alert('重连失败: ' + e.message); }
-  devCount = -1;                   // 强制重建，重新拉流
-  b.disabled = false;
+  devKey = ''; b.disabled = false;
 };
 
-/* ---------- 输入回传：浏览器操作 -> adb input ---------- */
 let devCtrl = false, lastCtrlIdx = 0, press = null;
 
 function setCtrl(on){
@@ -481,31 +492,30 @@ async function pollDevice(){
   let d;
   try { d = await api('/api/device_screen'); } catch { return; }
   const pill = $('#dev-pill');
-  const screens = d.screens || [];
+  const sc = d.screen;
   pill.textContent = d.connected
-    ? `${d.model || d.serial || '设备'} · ${screens.length}/${d.display_count} 块屏`
+    ? `${d.model || d.serial || '设备'} · D${(d.active ?? 0) + 1}/${d.display_count}`
     : (d.status || '未连接');
   pill.className = 'pill ' + (d.connected ? 'ok' : 'bad');
   $('#dev-status').textContent = d.enabled
     ? `${d.status}${d.serial ? '　序列号 ' + d.serial : ''}`
     : d.status;
 
-  if (!screens.length){
-    if (devCount !== 0){ devGrid.className = ''; devGrid.innerHTML =
-      `<div class="empty">${d.status || '未连接设备'}</div>`; devCount = 0; }
+  if (!(d.displays || []).length){
+    if (devKey !== 'none'){ devGrid.className = '';
+      devGrid.innerHTML = `<div class="empty">${d.status || '未连接设备'}</div>`; devKey = 'none'; }
     return;
   }
-  if (screens.length !== devCount){ buildDevGrid(screens); devCount = screens.length; }
-  screens.forEach(s => {
-    const cell = devGrid.querySelector(`.dev-cell[data-i="${s.index}"]`);
-    if (!cell) return;
-    // screencap 模式说明该屏的 screenrecord 回落到了主屏，标出来免得以为是卡顿
-    const mode = s.mode === 'screencap' ? ' · screencap' : '';
+  // 只有"选中的屏"变化时才重建 DOM，避免每次轮询都重连 MJPEG
+  const key = `${d.active}|${d.displays.length}|${d.serial}`;
+  if (key !== devKey){ buildDevView(d); devKey = key; devActive = d.active; }
+  const cell = devGrid.querySelector('.dev-cell');
+  if (cell && sc){
     cell.querySelector('[data-rt]').textContent =
-      s.connected ? `${s.width}x${s.height} · ${s.fps}fps${mode}` : s.status;
-    if (!s.connected) cell.querySelector('.dev-shot').classList.remove('live');
-    cell.querySelector('.ph').textContent = s.status;
-  });
+      sc.connected ? `${sc.width}x${sc.height} · ${sc.fps}fps · ${sc.mode || ''}` : sc.status;
+    if (!sc.connected) cell.querySelector('.dev-shot').classList.remove('live');
+    cell.querySelector('.ph').textContent = sc.status;
+  }
 }
 
 /* ---------- 面板折叠（状态存 localStorage，刷新后保持） ---------- */

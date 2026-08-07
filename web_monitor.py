@@ -5,8 +5,8 @@
   * MJPEG 实时画面（带 S1/S2/S3 标注与红框告警）
   * 网页内鼠标框选 ROI、一键自动标定
   * 网页内调相机参数（亮度/对比度/饱和度/增益/曝光/自动曝光）
-  * 设备投屏：adb 拉 Android 设备每块物理屏，路数跟随相机能检测的屏幕数，
-    显示在相机画面下方作对照
+  * 设备投屏：adb 拉 Android 设备屏幕显示在相机画面下方作对照；
+    同一时刻只投一块，网页上可切换（并发投屏会串台且拖低帧率）
   * 事件列表与证据截图
 
 相机同一时刻只能被一个进程占用：本服务运行期间不要再开 camera_diag.py 预览。
@@ -661,6 +661,22 @@ def _mjpeg(get_jpeg):
         gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
 
 
+class DeviceSelectIn(BaseModel):
+    index: int
+
+
+@app.post("/api/device_screen/select")
+def api_device_select(body: DeviceSelectIn):
+    """切换正在投的那块屏。同一时刻只投一路，切换即停旧开新。"""
+    if not device_screen:
+        raise HTTPException(409, "设备投屏未启用")
+    try:
+        idx = device_screen.select(body.index)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "active": idx}
+
+
 @app.get("/device_stream/{index}")
 async def device_stream(index: int):
     """第 index 块设备屏的 MJPEG 流（index 从 0 起，与相机 S1/S2/S3 顺序对应）。"""
@@ -835,7 +851,7 @@ def main():
         device_screen.start()
         serial, model = pick_device(args.adb_serial)
         print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}"
-              f"，路数跟随相机屏数（当前 {camera_screen_count()}）")
+              f"，同一时刻只投一块屏，可在网页上切换")
 
     if not args.no_device_context:
         device_ctx = DeviceContext(serial=args.adb_serial)
