@@ -16,6 +16,7 @@ GRAD_T = 55.0        # 网格梯度能量阈值（判花屏的必要条件）
 SAT_T = 0.30         # 高饱和噪点占比阈值（彩色马赛克型花屏走这条）
 GRAD_STRONG = 95.0   # 梯度极强：即使几乎无彩色，也判为花屏（灰度噪点/撕裂型）
 MIN_CELLS = 8        # 触发的最少连片网格数
+DYN_T = 8.0          # 网格帧间平均变化量下限：真花屏逐帧乱跳，静态彩色 UI 不会
 
 
 class ScreenDistortedDetector:
@@ -25,6 +26,7 @@ class ScreenDistortedDetector:
 
     def __init__(self, roi, scale, fps):
         self.roi = roi
+        self.prev = None        # 上一帧 ROI 灰度，用于判"这块花纹是不是在动"
 
     def process(self, small, gray, t):
         sx, sy, sw, sh = self.roi
@@ -35,6 +37,15 @@ class ScreenDistortedDetector:
         grad = cv2.magnitude(gx, gy)
         hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
         sat_hi = ((hsv[:, :, 1] > 150) & (hsv[:, :, 2] > 70)).astype(np.float32)
+        # 帧间差：真花屏的花纹逐帧随机重排，静态的彩色方块 UI 几乎不变。
+        # 实测台架上一块彩色方块 UI 会被误判为马赛克花屏（cells=8~10、score 0.3~0.45），
+        # 加这道判据后可与真花屏（cells=240、score 1.0）分开。
+        gi = g.astype(np.uint8)
+        dyn = None
+        if self.prev is not None and self.prev.shape == gi.shape:
+            dyn = cv2.absdiff(gi, self.prev).astype(np.float32)
+        self.prev = gi.copy()
+
         rows, cols = sh // CELL, sw // CELL
         if rows < 2 or cols < 2:
             return False, None, 0.0, ""
@@ -44,10 +55,13 @@ class ScreenDistortedDetector:
                 cg = grad[r*CELL:(r+1)*CELL, c*CELL:(c+1)*CELL]
                 cs = sat_hi[r*CELL:(r+1)*CELL, c*CELL:(c+1)*CELL]
                 gm, sm = cg.mean(), cs.mean()
-                # 梯度是必要条件；颜色异常与"梯度极强"任一成立即可，
-                # 避免灰度噪点型花屏因饱和度不足而整段漏检
-                if gm > GRAD_T and (sm > SAT_T or gm > GRAD_STRONG):
-                    mask[r, c] = 255
+                if not (gm > GRAD_T and (sm > SAT_T or gm > GRAD_STRONG)):
+                    continue
+                # 还要求这块在动；拿不到上一帧时（首帧）不拦
+                if dyn is not None:
+                    if dyn[r*CELL:(r+1)*CELL, c*CELL:(c+1)*CELL].mean() <= DYN_T:
+                        continue
+                mask[r, c] = 255
         n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         best = None
         for i in range(1, n):

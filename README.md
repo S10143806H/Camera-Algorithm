@@ -145,7 +145,18 @@ setsid nohup python3 -u web_monitor.py --device 0 --screens 3 > web.log 2>&1 &
 pkill -f "[w]eb_monitor.py"
 ```
 
-要开机自启就做成 systemd user 服务（`REPO`/`PY` 换成实际路径）：
+要开机自启就做成 systemd user 服务。仓库里带了模板 `deploy/screen-monitor.service`
+（用 `%h` 表示家目录，默认克隆到 `~/Camera-Algorithm`）：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/screen-monitor.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now screen-monitor
+loginctl enable-linger "$USER"      # 未登录时也保持运行
+```
+
+路径不同就手写（`REPO`/`PY` 换成实际路径）：
 
 ```bash
 REPO=$HOME/Camera-Algorithm
@@ -156,7 +167,7 @@ cat > ~/.config/systemd/user/screen-monitor.service <<EOF
 Description=Screen anomaly monitor
 [Service]
 WorkingDirectory=$REPO
-ExecStart=$PY -u $REPO/web_monitor.py --screens 3 --port 8000
+ExecStart=$PY -u $REPO/web_monitor.py --screens 3 --port 8000 --types black_screen,screen_distorted,screen_flicking
 Restart=always
 RestartSec=5
 [Install]
@@ -349,16 +360,30 @@ python3 web_monitor.py --types all                             # 全开
 | `screen_distorted` | GARBLE | 品红 | 花屏 / 马赛克 / 高频噪点 |
 | `screen_freeze` | FREEZE | 青 | 画面长时间完全静止 |
 
-> **默认只开黑屏是有原因的。** 实测在待机的车机台架上全开会刷屏误报：
+> **默认只开黑屏是有原因的。** 黑屏 / 花屏 / 闪屏可放心常开（本仓库的
+> `deploy/screen-monitor.service` 即这三类）；**白屏与冻屏建议按需开**。
+> 实测在待机的车机台架上全开会刷屏误报：
 > `screen_freeze` 在三块屏上 **100% 命中**（待机画面本来就静止），
 > `white_screen` 在显示白底页面的那块屏上常驻命中 —— 一分钟就生成 26 个事件、
 > 344MB 证据。这两类的语义依赖"这块屏此刻本该在动 / 本该有内容"，
 > 需按台架实际用途按需开启。花屏与闪屏没有这个问题。
 
-**花屏判据已放宽**：原先要求同一网格"梯度达标 **且** 高饱和度达标"，实测灰度
-噪点型花屏会整段漏检（240/240 网格梯度超阈，但只有 3 个网格饱和度达标 → 一帧
-不报）。改为"梯度达标，且（颜色异常 **或** 梯度极强）"后，同一段样本命中
-60/60 帧，彩色型花屏的结果不变，正常画面仍零误报。
+**花屏判据改过两轮**：
+
+1. **放宽**——原先要求同一网格"梯度达标 **且** 高饱和度达标"，灰度噪点型花屏
+   整段漏检（240/240 网格梯度超阈，但只有 3 个网格饱和度达标 → 一帧不报）。
+   改为"梯度达标，且（颜色异常 **或** 梯度极强）"，该样本命中 60/60 帧。
+2. **加时间判据**——放宽后在实机上误报：一块显示**彩色方块 UI** 的屏被当成马赛克
+   花屏，5 分钟刷了 7 个事件（`cells=8~10`、score 0.3~0.45，而真花屏是 cells=240、
+   score 1.0）。真花屏的花纹**逐帧随机重排**，静态彩色 UI 不会，于是要求网格
+   帧间平均变化量 > `DYN_T`。实测该屏 500 帧误报归零，两段合成花屏命中数不变。
+
+| 样本 | 放宽前 | 放宽后 | 加时间判据后 |
+|---|---|---|---|
+| 噪点型花屏（真值 60 帧） | 0 | 60 | 60 |
+| 彩色型花屏 | 19 | 19 | 19 |
+| 正常三屏视频 | 0 | 0 | 0 |
+| 实机彩色 UI 屏（500 帧） | — | 19.3% 误报 | **0** |
 
 ### 设备投屏
 

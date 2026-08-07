@@ -1,0 +1,16 @@
+[Unit]
+Description=Screen anomaly monitor (camera + device screencast)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Camera-Algorithm
+ExecStart=%h/Camera-Algorithm/.venv/bin/python3 -u %h/Camera-Algorithm/web_monitor.py --screens 3 --port 8000 --types black_screen,screen_distorted,screen_flicking
+Restart=always
+RestartSec=5
+# 相机被 USB 重新枚举后 index 会变，这里不写死 --device，交给启动时自动诊断
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
