@@ -30,6 +30,11 @@ RETRY_S = 3.0            # 设备不在 / 出错时的重试间隔
 # 同一块屏应接近 1，串台时会掉到 0.3 以下。
 FALLBACK_CORR_MIN = 0.40
 FALLBACK_STRIKES = 2          # 连续几次校验不过才切，避免画面变化引起的误判
+FALLBACK_MARGIN = 0.15        # 兄弟屏要明显更像才算串台，否则视为时间错位
+# 并发 screenrecord 的路数上限。实测该车机三路并发必串台，两路可用
+# （IVI+Cluster、IVI+Rear 均正确，Cluster+Rear 串台），降分辨率也救不回来。
+# 超出上限的屏直接走 screencap 轮询，慢但每块都读得对。
+DEFAULT_RECORD_MAX = 2
 VERIFY_INTERVAL_S = 15.0      # screenrecord 模式下周期性复检；串台是运行中才发生的，
                               # 间隔越短，显示错误画面的窗口越小（每次仅一张 screencap 开销）
 SCREENCAP_INTERVAL_S = 0.45
@@ -190,9 +195,11 @@ class DeviceScreenService:
     """后台线程持续拉某一块显示屏，产出 JPEG 供 HTTP 取用。"""
 
     def __init__(self, serial, display, bitrate="4M", jpeg_quality=70,
-                 force_mode=None):
+                 force_mode=None, siblings=None):
         self.serial = serial
         self.display = display              # list_displays() 的一项
+        self.siblings = [d for d in (siblings or [])
+                         if d["display_id"] != display["display_id"]]
         self.bitrate = bitrate
         self.jpeg_quality = jpeg_quality
 
@@ -273,24 +280,46 @@ class DeviceScreenService:
     def _verify_not_fallback(self, frame):
         """用 screencap 校验 screenrecord 拿到的确实是这块屏。
 
-        比结构而非亮度：并发 screenrecord 串台时，两块屏可能都是亮的，
-        只看亮度分不出来；结构相关度能直接判出"这画面根本不是这块屏"。
+        判据是"相对"而非"绝对"：screenrecord 有数秒编码延迟，与瞬时 screencap
+        天然对不齐，屏上一有动画/视频，即使来源正确相关度也可能只有 0.2~0.3。
+        实测三块屏来源全都正确时，绝对阈值仍把它们逐个误判成串台，全部降到
+        0.3~1.1fps 的 screencap 轮询。
+
+        真串台的特征是"更像另一块屏"，所以只在自身相关度偏低时才多抓几张
+        兄弟屏的 screencap 比一比：只有某块兄弟屏明显更像，才判定回落。
         """
         ref = screencap_frame(self.serial, self.display["display_id"])
         if ref is None:
             return True                 # 校验不了就不误判
-        corr = float((self._signature(frame) * self._signature(ref)).mean())
+        sig = self._signature(frame)
+        corr = float((sig * self._signature(ref)).mean())
         with self.lock:
             self.last_corr = round(corr, 3)
         if corr >= FALLBACK_CORR_MIN:
             self._strikes = 0
             return True
+
+        # 自身相关度低：可能只是延迟/画面在动，也可能真串台——比兄弟屏
+        best_other, best_corr = None, -2.0
+        for d in self.siblings:
+            other = screencap_frame(self.serial, d["display_id"])
+            if other is None:
+                continue
+            c = float((sig * self._signature(other)).mean())
+            if c > best_corr:
+                best_other, best_corr = d, c
+        if best_other is None or best_corr < corr + FALLBACK_MARGIN:
+            # 没有哪块兄弟屏更像，判为时间错位而非串台，保住 screenrecord 帧率
+            self._strikes = 0
+            return True
+
         self._strikes += 1
         if self._strikes < FALLBACK_STRIKES:
             return True                 # 可能只是画面变化，再看一次
         print(f"⚠️ display {self.display['display_id']} ({self.display.get('name')}): "
-              f"screenrecord 画面与该屏 screencap 结构相关度仅 {corr:.2f}"
-              f"（连续 {self._strikes} 次），判定为串台/回落，改用 screencap 轮询")
+              f"screenrecord 画面更像 {best_other.get('name')}"
+              f"（{best_corr:.2f} vs 自身 {corr:.2f}，连续 {self._strikes} 次），"
+              f"判定为串台/回落，改用 screencap 轮询")
         return False
 
     def _run_screencap(self, enc):
@@ -406,13 +435,15 @@ class DeviceScreenManager:
     """按相机当前能检测的屏幕数决定开几路投屏，设备增减时自动跟随。"""
 
     def __init__(self, serial=None, bitrate="4M", jpeg_quality=70,
-                 target_count=None, display_ids=None, force_mode=None):
+                 target_count=None, display_ids=None, force_mode=None,
+                 record_max=DEFAULT_RECORD_MAX):
         self.serial = serial
         self.bitrate = bitrate
         self.jpeg_quality = jpeg_quality
         self.target_count = target_count or (lambda: 3)   # 由相机侧提供
         self.display_ids = display_ids                    # 手动指定顺序时用
         self.force_mode = force_mode                      # None=自动，"screencap"=强制轮询
+        self.record_max = max(0, int(record_max))         # 同时跑 screenrecord 的路数上限
 
         self.lock = threading.Lock()
         self.services = []
@@ -506,10 +537,14 @@ class DeviceScreenManager:
                 s.stop()
         else:                             # 增加：为新的显示屏开流
             for i in range(cur, want):
+                # 前 record_max 路用 screenrecord，其余直接 screencap：
+                # 与其让它们并发串台再被校验降级（期间画面是错的），不如一开始就分配好
+                mode = self.force_mode or (None if i < self.record_max else "screencap")
                 svc = DeviceScreenService(self.active_serial, displays[i],
                                           bitrate=self.bitrate,
                                           jpeg_quality=self.jpeg_quality,
-                                          force_mode=self.force_mode)
+                                          force_mode=mode,
+                                          siblings=displays)
                 svc.start()
                 with self.lock:
                     self.services.append(svc)

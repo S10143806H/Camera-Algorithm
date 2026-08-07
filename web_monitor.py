@@ -753,6 +753,9 @@ def main():
     ap.add_argument("--no-device-screen", action="store_true",
                     help="不启用 Android 设备投屏（默认自动探测 adb 设备）")
     ap.add_argument("--adb-serial", help="指定 adb 设备序列号（多台设备时）")
+    ap.add_argument("--device-record-max", type=int, default=2,
+                    help="同时用 screenrecord 的投屏路数上限（默认2）。实测该类车机"
+                         "三路并发会串台，超出的屏自动改用 screencap 轮询（慢但正确）")
     ap.add_argument("--device-displays",
                     help="手动指定投屏的 display-id 及顺序，逗号分隔；"
                          "缺省按设备 port 顺序自动枚举")
@@ -827,7 +830,8 @@ def main():
             target_count=camera_screen_count,
             display_ids=[d.strip() for d in args.device_displays.split(",") if d.strip()]
                         if args.device_displays else None,
-            force_mode=None if args.device_stream_mode == "auto" else args.device_stream_mode)
+            force_mode=None if args.device_stream_mode == "auto" else args.device_stream_mode,
+            record_max=args.device_record_max)
         device_screen.start()
         serial, model = pick_device(args.adb_serial)
         print(f"📱 设备投屏: {'已连接 ' + (model or serial) if serial else '未检测到 adb 设备（插上后会自动重连）'}"

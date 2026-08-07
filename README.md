@@ -274,6 +274,7 @@ export QT_QPA_PLATFORM=xcb                         # Wayland 下预览窗口异�
 | `--no-device-screen` | `web_monitor` | 关掉设备投屏（默认自动探测 adb 设备） |
 | `--adb-serial S` | `web_monitor` | 多台设备时指定序列号 |
 | `--device-displays` | `web_monitor` | 手动指定投屏的 display-id 及顺序（逗号分隔），缺省按 port 自动枚举 |
+| `--device-record-max N` | `web_monitor` | 同时用 screenrecord 的路数上限，默认 2；超出的屏走 screencap 轮询 |
 | `--device-bitrate` | `web_monitor` | 投屏码率，默认 `4M`；分辨率按各屏原始宽高比自动缩放（长边 ≤1280） |
 | `--device-stream-mode` | `web_monitor` | `auto`（默认，串台自动降级）或 `screencap`（直接轮询，慢但从头就对） |
 | `--finalize` | `analyze_screen_*` | 合并分段视频 + 生成证据图（需 ffmpeg） |
@@ -413,6 +414,42 @@ python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 | 设备掉线 | 退到"未连接"并每 3 秒重试，插回后自动恢复，不影响相机检测 |
 | 看大图 | 点任一路投屏画面可放大查看 |
 | 手动重连 | 网页上点「重连投屏」（会重新做一次回落校验） |
+
+#### 投屏帧率与 screenrecord 并发上限
+
+实测这类车机**不能同时对三块屏跑 `screenrecord --display-id`**：并发时部分屏会
+静默串台（拿到的是另一块屏的画面）。逐组合验证：
+
+| 组合 | 结果 |
+|---|---|
+| 单独一路 | 三块屏都正确 |
+| IVI + Cluster | 正确 |
+| IVI + Rear | 正确 |
+| Cluster + Rear | **串台** |
+| 三路并发 | **串台**（降到 640 长边 / 1M 码率反而更糟） |
+
+因此默认 `--device-record-max 2`：前两路走 screenrecord（约 20fps），其余直接走
+screencap。与其让它们并发串台再被校验降级（期间画面是错的），不如一开始分配好。
+
+**剩下那一路快不起来是设备端限制**，不是传输问题：
+
+```
+Rear Display 单帧 screencap 拆解
+  设备端 capture + PNG 编码   1961 ms      ← 瓶颈
+  USB 传输 2.6MB                243 ms
+  常驻 adb shell 连抓         1963 ms/次   ← 省掉连接开销也没用
+```
+
+**串台判据改为相对比较**：screenrecord 有数秒编码延迟，与瞬时 screencap 天然对不齐，
+屏上一有动画，来源正确时相关度也可能只有 0.2~0.3。早先的绝对阈值 0.40 把三路
+来源全部正确的流逐个误判成串台、全降到 0.3~1.1fps。现在只有"更像另一块屏"
+（超出自身相关度 `FALLBACK_MARGIN`）才判定回落。
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| D1 IVI | 0.7 fps (screencap) | **21.0 fps** (screenrecord) |
+| D2 Cluster | 1.1 fps (screencap) | **21.6 fps** (screenrecord) |
+| D3 Rear | 0.3 fps (screencap) | 0.4 fps（设备端上限） |
 | 远程操作 | 打开「控制」后可直接在网页上操作设备，见下 |
 
 **远程操作**：投屏面板的「控制」按钮默认**关**——关闭时点画面是看大图，避免看监控时误触设备。
