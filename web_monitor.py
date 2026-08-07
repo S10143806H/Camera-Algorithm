@@ -69,22 +69,55 @@ MAX_EVENTS_KEPT = 200
 
 
 # ---------------------------------------------------------------- ROI 持久化
-def load_rois():
-    """读取上次保存的 ROI，使网页里标定过一次后重启仍生效。"""
+def load_rois(frame_size=None):
+    """读取上次保存的 ROI，使网页里标定过一次后重启仍生效。
+
+    ROI 是像素坐标，和标定时的采集分辨率绑定。相机重新枚举后 OpenCV 可能
+    协商到另一档分辨率（实测 1280x720 → 640x480），此时旧 ROI 会整体错位甚至
+    越界，检测立刻开始误报黑屏。这里按分辨率比例换算回来。
+    """
     try:
         data = json.loads(ROI_STORE.read_text(encoding="utf-8"))
-        return [tuple(int(v) for v in r) for r in data.get("rois", [])]
+        rois = [tuple(int(v) for v in r) for r in data.get("rois", [])]
     except Exception:
         return []
+    if not rois or not frame_size:
+        return rois
+
+    saved = data.get("frame_size")
+    cw, ch = frame_size
+    if not saved or len(saved) != 2 or not all(saved):
+        print(f"⚠️ 已存 ROI 未记录标定分辨率，按当前 {cw}x{ch} 直接使用；"
+              f"若框位不对请在网页上重新标定")
+        return [_clamp_roi(r, cw, ch) for r in rois]
+
+    sw, sh = int(saved[0]), int(saved[1])
+    if (sw, sh) == (cw, ch):
+        return rois
+    fx, fy = cw / sw, ch / sh
+    scaled = [_clamp_roi((int(round(x * fx)), int(round(y * fy)),
+                          int(round(w * fx)), int(round(h * fy))), cw, ch)
+              for x, y, w, h in rois]
+    print(f"🔄 采集分辨率由标定时的 {sw}x{sh} 变为 {cw}x{ch}，ROI 已按比例换算")
+    return scaled
 
 
-def save_rois(rois):
+def _clamp_roi(roi, w, h):
+    """把 ROI 夹回画面内，越界的框会让检测读到空区域而误判黑屏。"""
+    x, y, rw, rh = roi
+    x = max(0, min(int(x), w - 1)); y = max(0, min(int(y), h - 1))
+    rw = max(1, min(int(rw), w - x)); rh = max(1, min(int(rh), h - y))
+    return (x, y, rw, rh)
+
+
+def save_rois(rois, frame_size=None):
     try:
-        ROI_STORE.write_text(
-            json.dumps({"rois": [list(r) for r in rois],
-                        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds")},
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8")
+        payload = {"rois": [list(r) for r in rois],
+                   "saved_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+        if frame_size:
+            payload["frame_size"] = [int(frame_size[0]), int(frame_size[1])]
+        ROI_STORE.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
     except OSError as e:
         print(f"⚠️ ROI 保存失败: {e}")
 
@@ -172,9 +205,19 @@ class MonitorService:
             cap, info = opened
             self.cap = cap
             with self.lock:
+                old = (int(self.info.get("w") or 0), int(self.info.get("h") or 0))
+                new = (int(info.get("w") or 0), int(info.get("h") or 0))
                 self.info = info
                 if self.cam_name:
                     self.info.setdefault("name", self.cam_name)
+                # 重连后分辨率若变了，ROI 必须同步换算，否则立刻开始误报黑屏
+                if old != new and all(old) and all(new) and self.rois:
+                    fx, fy = new[0] / old[0], new[1] / old[1]
+                    self.rois = [_clamp_roi((round(x * fx), round(y * fy),
+                                             round(w * fx), round(h * fy)), *new)
+                                 for x, y, w, h in self.rois]
+                    self._screen_state.clear()
+                    print(f"🔄 重连后分辨率 {old[0]}x{old[1]} → {new[0]}x{new[1]}，ROI 已换算")
                 self.cam_online, self.cam_status = True, "采集中"
                 self.reconnects += 1
             print(f"✅ 相机已重连: idx={idx} {info.get('backend')} "
@@ -314,8 +357,13 @@ class MonitorService:
             self.rois = rois
             self.results = []
             self._screen_state.clear()
-        save_rois(rois)
+        save_rois(rois, self.frame_size())
         return rois
+
+    def frame_size(self):
+        """当前采集分辨率，用于把 ROI 与分辨率绑定保存。"""
+        with self.lock:
+            return (int(self.info.get("w") or 0), int(self.info.get("h") or 0))
 
     def set_detect(self, on):
         with self.lock:
@@ -654,6 +702,9 @@ def main():
                          "screencap=直接用轮询（慢但从第一帧就保证对得上）")
     ap.add_argument("--no-device-context", action="store_true",
                     help="不采集设备状态与 logcat（默认开启，用于黑屏归因）")
+    ap.add_argument("--width", type=int, default=1280,
+                    help="固定采集宽度（默认1280；ROI 与分辨率绑定，别随意改）")
+    ap.add_argument("--height", type=int, default=720, help="固定采集高度（默认720）")
     ap.add_argument("--gtmp-task", type=int, help="关联 GTMP 任务 ID，事件附带任务上下文")
     ap.add_argument("--gtmp-bench", type=int, help="关联 GTMP 台架 ID，自动跟踪其运行中的任务")
     args = ap.parse_args()
@@ -663,10 +714,23 @@ def main():
         print("❌ 打不开相机，Web 服务未启动")
         return 1
     cap, info = opened
+
+    # 固定采集分辨率：诊断流程可能协商到 640x480 等其它档位，而 ROI 是像素坐标，
+    # 分辨率一变就整体错位并立刻误报黑屏。这里统一钉死，取不到就退回实际值。
+    want_w, want_h = args.width, args.height
+    if want_w and want_h and (int(info.get("w") or 0), int(info.get("h") or 0)) != (want_w, want_h):
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, want_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, want_h)
+        for _ in range(5):
+            cap.read()
+        info["w"], info["h"] = int(cap.get(3)), int(cap.get(4))
+        if (info["w"], info["h"]) != (want_w, want_h):
+            print(f"⚠️ 相机不支持 {want_w}x{want_h}，实际使用 {info['w']}x{info['h']}")
     print(f"✅ 相机就绪: idx={info.get('idx')} {info.get('backend')} "
           f"{info.get('w')}x{info.get('h')}")
 
-    rois = parse_rois(args.roi) if args.roi else load_rois()
+    rois = parse_rois(args.roi) if args.roi else load_rois((info.get("w"), info.get("h")))
     if rois:
         print(f"🖥️ 载入 ROI ({len(rois)} 块): {format_rois(rois)}")
 

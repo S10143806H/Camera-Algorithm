@@ -145,17 +145,18 @@ setsid nohup python3 -u web_monitor.py --device 0 --screens 3 > web.log 2>&1 &
 pkill -f "[w]eb_monitor.py"
 ```
 
-要开机自启就做成 systemd user 服务（`REPO` 换成实际克隆路径）：
+要开机自启就做成 systemd user 服务（`REPO`/`PY` 换成实际路径）：
 
 ```bash
 REPO=$HOME/Camera-Algorithm
+PY=$REPO/.venv/bin/python3
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/screen-monitor.service <<EOF
 [Unit]
 Description=Screen anomaly monitor
 [Service]
 WorkingDirectory=$REPO
-ExecStart=$REPO/.venv/bin/python -u web_monitor.py --device 0 --screens 3
+ExecStart=$PY -u $REPO/web_monitor.py --screens 3 --port 8000
 Restart=always
 RestartSec=5
 [Install]
@@ -257,6 +258,7 @@ export QT_QPA_PLATFORM=xcb                         # Wayland 下预览窗口异�
 | `--out DIR` | `camera_diag --batch`、`analyze_*` | 输出目录 |
 | `--port` / `--host` | `web_monitor` | 监听端口 / 地址，默认 `0.0.0.0:8000` |
 | `--quality N` | `web_monitor` | MJPEG 质量 1–100，默认 75；带宽紧张可调低 |
+| `--width` / `--height` | `web_monitor` | 固定采集分辨率，默认 `1280x720`。**ROI 是像素坐标，与分辨率绑定，别随意改** |
 | `--no-device-screen` | `web_monitor` | 关掉设备投屏（默认自动探测 adb 设备） |
 | `--adb-serial S` | `web_monitor` | 多台设备时指定序列号 |
 | `--device-displays` | `web_monitor` | 手动指定投屏的 display-id 及顺序（逗号分隔），缺省按 port 自动枚举 |
@@ -601,6 +603,8 @@ python3 notify/feishu_notifier.py --test
 | `--finalize` 报未找到 ffmpeg | 未安装 ffmpeg | `sudo apt install ffmpeg`；无 sudo 时 `pip install imageio-ffmpeg` 后将其二进制软链到 PATH |
 | Wayland 下预览窗口异常 | Qt 后端不匹配 | `export QT_QPA_PLATFORM=xcb` 后重跑 |
 | 网页画面不动、顶部标签变红 | 相机掉线（USB 重新枚举 `/dev/videoN` 换号） | 服务会自动重新枚举并找回（实测约 5 秒），无需干预；顶部标签会显示重连次数 |
+| 重启后突然满屏误报黑屏 | 相机协商到了别的分辨率（实测 1280x720 → 640x480），ROI 整体错位 | 已修：启动固定 `--width/--height`，且 ROI 存盘时记录标定分辨率、载入时按比例换算 |
+| 判定在 BLACK / ok 之间快速闪烁 | 自动曝光在追光，画面亮度反复漂移 | 网页相机参数里把 `AutoExp 0/1` 调 0（手动），再固定 `Exposure`；这是误报第一来源 |
 | 所有 MJPEG 流掉到 ~1fps | 相机掉线后旧版本会空转拖垮进程 | 已修（掉线自愈）；旧版本需手动重启并用正确的 `--device` |
 | `createTrackbar` 报 `NULL window handler` | 窗口句柄名含非 ASCII 字符 | Linux 的 Qt highgui 后端不支持，句柄名保持 ASCII，中文用 `cv2.setWindowTitle` 设置 |
 | Web 版报相机打不开 | 相机被 `camera_diag.py` 预览占用 | 同一时刻只能一个进程持有相机，先 `pkill -f camera_diag.py` |
