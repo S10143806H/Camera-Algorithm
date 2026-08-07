@@ -46,7 +46,7 @@
   .dev-cell .cap .nm{color:var(--fg);font-weight:600}
   .dev-cell .cap .rt{margin-left:auto;font-variant-numeric:tabular-nums}
   .dev-shot{position:relative;background:#000;min-height:110px;line-height:0}
-  .dev-shot img{width:100%;height:auto;display:block;cursor:zoom-in}
+  .dev-shot img{width:100%;height:auto;display:block;cursor:crosshair;touch-action:none}
   .dev-shot img:not([src]){display:none}
   .dev-shot .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
                 color:var(--dim);font-size:12px;text-align:center;padding:14px}
@@ -129,16 +129,12 @@
       <div class="fold">
         <div id="dev-grid"><div class="empty">等待设备…</div></div>
         <div class="toolbar">
-          <button id="btn-dev-ctrl">控制：关</button>
-          <button id="btn-key-home" disabled>HOME</button>
-          <button id="btn-key-back" disabled>BACK</button>
-          <button id="btn-key-power" disabled>POWER</button>
           <button id="btn-dev-restart">重连投屏</button>
           <span class="hint" style="padding:0;align-self:center" id="dev-status">—</span>
         </div>
         <div class="hint" id="dev-ctrl-hint">
-          控制关闭时点画面是看大图。打开后：单击=点按 · 拖动=滑动 · 键盘输入=发文字，
-          回车/退格发对应按键；按键按钮作用于最后一次点击过的那块屏。
+          直接在投屏画面上操作设备：单击 = 点按 · 拖动 = 滑动。
+          点过画面后键盘输入会发到设备（回车 / 退格发对应按键），点页面其它地方即退出。
         </div>
       </div>
     </div>
@@ -404,7 +400,7 @@ function buildDevView(d){
   img.addEventListener('load', () => shot.classList.add('live'));
   img.addEventListener('error', () => shot.classList.remove('live'));
   img.src = `/device_stream/${act}?t=${Date.now()}`;
-  img.style.cursor = devCtrl ? 'crosshair' : 'zoom-in';
+  img.style.cursor = 'crosshair';
   lastCtrlIdx = act;                  // 按键作用于当前这块屏
   devGrid.querySelectorAll('button.pick').forEach(b => {
     b.onclick = async () => {
@@ -423,17 +419,9 @@ $('#btn-dev-restart').onclick = async () => {
   devKey = ''; b.disabled = false;
 };
 
-let devCtrl = false, lastCtrlIdx = 0, press = null;
-
-function setCtrl(on){
-  devCtrl = on;
-  $('#btn-dev-ctrl').textContent = '控制：' + (on ? '开' : '关');
-  $('#btn-dev-ctrl').classList.toggle('primary', on);
-  ['home','back','power'].forEach(k => $('#btn-key-' + k).disabled = !on);
-  devGrid.querySelectorAll('.dev-shot img').forEach(
-    i => i.style.cursor = on ? 'crosshair' : 'zoom-in');
-}
-$('#btn-dev-ctrl').onclick = () => setCtrl(!devCtrl);
+// 投屏画面上直接操作设备：控制常开，单击=点按、拖动=滑动。
+// 键盘只在点过投屏画面之后才转发，避免抢走页面上其它输入。
+let lastCtrlIdx = 0, press = null, devFocused = false;
 
 async function sendInput(idx, body){
   try { return await api(`/api/device_screen/${idx}/input`, 'POST', body); }
@@ -447,14 +435,15 @@ function normPos(img, ev){
 
 devGrid.addEventListener('pointerdown', e => {
   const img = e.target.closest('.dev-shot img');
-  if (!img || !devCtrl) return;
+  if (!img) return;
+  devFocused = true;
   lastCtrlIdx = +img.closest('.dev-cell').dataset.i;
   press = {t: Date.now(), ...normPos(img, e), img, idx: lastCtrlIdx};
   e.preventDefault();               // 阻止图片被浏览器当成可拖拽对象
 });
 // 收笔监听挂在 window 上：拖到画面外松手也算数，且不依赖 pointer capture
 addEventListener('pointerup', e => {
-  if (!devCtrl || !press) return;
+  if (!press) return;
   const p = normPos(press.img, e);
   const moved = Math.hypot(p.x - press.x, p.y - press.y);
   // 位移超过画面 2% 视为滑动，否则按点按
@@ -465,27 +454,18 @@ addEventListener('pointerup', e => {
     sendInput(press.idx, {action: 'tap', x: p.x, y: p.y});
   press = null;
 });
+// 点到投屏画面以外就交还键盘
+addEventListener('pointerdown', e => {
+  if (!e.target.closest('.dev-shot img')) devFocused = false;
+}, true);
 
-['home','back','power'].forEach(k => {
-  $('#btn-key-' + k).onclick = () => sendInput(lastCtrlIdx, {action: 'key', key: k.toUpperCase()});
-});
-
-// 控制打开时键盘直接发到设备（灯箱打开或在输入框里时不拦截）
+// 点过投屏画面后，键盘直接发到设备（灯箱打开或在输入框里时不拦截）
 addEventListener('keydown', e => {
-  if (!devCtrl || !lb.hidden) return;
+  if (!devFocused || !lb.hidden) return;
   if (e.target.matches('input, textarea')) return;
   if (e.key === 'Enter')        { sendInput(lastCtrlIdx, {action:'key', key:'ENTER'}); e.preventDefault(); }
   else if (e.key === 'Backspace'){ sendInput(lastCtrlIdx, {action:'key', key:'DEL'}); e.preventDefault(); }
   else if (e.key.length === 1)  { sendInput(lastCtrlIdx, {action:'text', text:e.key}); e.preventDefault(); }
-});
-
-// 控制关闭时，点画面还是看大图
-devGrid.addEventListener('click', e => {
-  const img = e.target.closest('.dev-shot img');
-  if (!img || devCtrl || !img.getAttribute('src')) return;
-  const cell = img.closest('.dev-cell');
-  openLightbox(img.src, cell.querySelector('.nm').textContent,
-               cell.querySelector('[data-rt]').textContent);
 });
 
 async function pollDevice(){
