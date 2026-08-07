@@ -548,20 +548,23 @@ def _put_text_clamped(img, text, x, y, scale, color, thick=2):
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
-def draw_screen_boxes(img, numbered_rois, active=None):
+def draw_screen_boxes(img, numbered_rois, active=None, tags=None):
     """画每块屏幕的标定框 + 编号。
 
     numbered_rois: [(screen_no, roi), ...] —— 编号由调用方给定，
     不能按列表下标重排，否则单屏事件图会把 S3 画成 S1。
     active: 异常屏幕编号集合（画红色）。
+    tags: {屏号: 简写}，异常时附在编号后；缺省不写死"BLACK"，
+          否则花屏等其它类型的事件图上会叠出"S1 BLACK"的错误标签。
     """
     active = active or set()
+    tags = tags or {}
     for no, roi in numbered_rois:
         rx, ry, rw, rh = roi
         bad = no in active
         color = (0, 0, 255) if bad else (255, 160, 0)
         cv2.rectangle(img, (rx, ry), (rx + rw, ry + rh), color, 3 if bad else 2)
-        label = f"S{no}" + (" BLACK" if bad else "")
+        label = f"S{no}" + (f" {tags.get(no, '')}".rstrip() if bad else "")
         (tw, th_), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
         lx = int(min(rx, img.shape[1] - tw - 12))
         ly = ry + th_ + 6 if ry < th_ + 8 else ry - 6
@@ -571,41 +574,76 @@ def draw_screen_boxes(img, numbered_rois, active=None):
     return img
 
 
+def _res_parts(result):
+    """把两种结果形状统一成 (异常, bbox, 短标签, 颜色)。
+
+    黑屏检测返回 {abnormal, region:{bbox, dark_pct}}；anomaly_core 系检测器
+    经 live_detectors 适配后返回 {abnormal, bbox, score, info, label, color}。
+    """
+    if not result or not result.get("abnormal"):
+        return False, None, "", (0, 0, 255), ""
+    region = result.get("region")
+    short = result.get("short") or ""
+    if region and region.get("bbox"):
+        return (True, region["bbox"],
+                f"dark={region.get('dark_pct', 0):.0f}%",
+                tuple(result.get("color") or (0, 0, 255)), short or "BLACK")
+    return (True, result.get("bbox"), result.get("info") or "",
+            tuple(result.get("color") or (0, 0, 255)), short or "ABNORMAL")
+
+
 def annotate_live_multi(frame, results, ts_text, summary=True):
-    """多屏标注：每块屏幕独立编号与判定，异常屏幕红框高亮，正常屏幕橙框。
+    """多屏标注：每块屏独立编号与判定，异常处按类型配色高亮，正常屏橙框。
 
     results: [(screen_no, roi, result), ...]；screen_no==0 表示整幅画面模式。
-    summary=False 供批量模式使用（那边自己写多行事件抬头，避免文字叠字）。
+    result 可以是黑屏形状，也可以是 live_detectors 适配后的通用形状。
+    summary=False 供批量/事件图使用（那边自己写抬头，避免文字叠字）。
     """
     annotated = frame.copy()
+    parsed = [(no, roi) + _res_parts(res) for no, roi, res in results]
+
     overlay = None
-    for no, roi, result in results:
-        if not (result["abnormal"] and result["region"]):
+    for no, roi, abn, bbox, label, color, short in parsed:
+        if not (abn and bbox):
             continue
-        x, y, w_, h_ = result["region"]["bbox"]
+        x, y, w_, h_ = bbox
         if overlay is None:
             overlay = annotated.copy()
-        cv2.rectangle(overlay, (x, y), (x + w_, y + h_), (0, 0, 255), -1)
+        cv2.rectangle(overlay, (x, y), (x + w_, y + h_), color, -1)
     if overlay is not None:
         annotated = cv2.addWeighted(overlay, 0.22, annotated, 0.78, 0)
 
-    bad = set()
-    for no, roi, result in results:
-        if not (result["abnormal"] and result["region"]):
+    bad, bad_label = set(), {}
+    for no, roi, abn, bbox, label, color, short in parsed:
+        if not abn:
             continue
         bad.add(no)
-        x, y, w_, h_ = result["region"]["bbox"]
-        cv2.rectangle(annotated, (x, y), (x + w_, y + h_), (0, 0, 255), 5)
-        tag = f"S{no} " if no else ""
-        _put_text_clamped(annotated, f"{tag}BLACK  dark={result['region']['dark_pct']:.0f}%",
-                          x, y - 12, 0.65, (0, 0, 255))
+        bad_label.setdefault(no, []).append(short)
+        if not bbox:
+            continue
+        x, y, w_, h_ = bbox
+        cv2.rectangle(annotated, (x, y), (x + w_, y + h_), color, 5)
+        # bbox 与 ROI 基本重合时，屏幕框上的短代号已经说明类型，
+        # 再画一次细标签只会叠字，这里只在异常区明显小于整屏时才画
+        if label and (not roi or abs(x - roi[0]) > 8 or abs(y - roi[1]) > 8):
+            _put_text_clamped(annotated, f"{short} {label}", x, y - 12, 0.6, color)
 
-    numbered = [(no, roi) for no, roi, _ in results if roi]
+    numbered = []
+    seen = set()
+    for no, roi, *_ in parsed:
+        if roi and no not in seen:
+            seen.add(no)
+            numbered.append((no, roi))
     if numbered:
-        draw_screen_boxes(annotated, numbered, active=bad)
+        tags = {no: "/".join(dict.fromkeys(v)) for no, v in bad_label.items()}
+        draw_screen_boxes(annotated, numbered, active=bad, tags=tags)
     if summary:
-        text = ("  ".join(f"S{no}:{'BLACK' if no in bad else 'ok'}" for no, _, _ in results)
-                if numbered else ("BLACK SCREEN" if bad else "normal/dim screen"))
+        if numbered:
+            text = "  ".join(
+                f"S{no}:{'/'.join(dict.fromkeys(bad_label[no])) if no in bad else 'ok'}"
+                for no, _ in numbered)
+        else:
+            text = "ABNORMAL" if bad else "normal/dim screen"
         _put_text_clamped(annotated, text, 12, 34, 0.8,
                           (0, 0, 255) if bad else (0, 180, 0))
     _put_text_clamped(annotated, ts_text, 12, annotated.shape[0] - 40, 0.7, (0, 215, 255))
@@ -618,7 +656,8 @@ def annotate_live(frame, result, ts_text):
 
 
 def emit_merged_event(evidence, source_name, out_root, seq, notifier=None,
-                      screen_no=0, screen_roi=None, screen_total=1):
+                      screen_no=0, screen_roi=None, screen_total=1,
+                      event_type="black_screen", label="BLACK SCREEN"):
     """把缓存的多帧证据合并成一次完整事件：拼图 + event.json + 飞书(带图)。
 
     evidence: [(frame, result, ts_text, video_time_s, frame_index, wallclock), ...]
@@ -628,7 +667,8 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None,
     now = datetime.now()
     tag = f"_S{screen_no}" if screen_no else ""
     eid = f"CAM_{now.strftime('%Y%m%d_%H%M%S')}{tag}_{seq:03d}"
-    ev_dir = out_root / (f"screen_{screen_no}" if screen_no else "full_frame") / eid
+    ev_dir = (out_root / (f"screen_{screen_no}" if screen_no else "full_frame")
+              / event_type / eid)
     ev_dir.mkdir(parents=True, exist_ok=True)
 
     # 逐帧标注 -> 缩略 -> 拼图 (5列)
@@ -647,13 +687,22 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None,
         r, c = divmod(i, cols)
         sheet[header_h + r * th_: header_h + (r + 1) * th_, c * tw:(c + 1) * tw] = t
 
-    best = max(evidence, key=lambda e: e[1]["region"]["dark_pct"])
-    score = round(min(1.0, best[1]["region"]["dark_pct"] / 100.0), 3)
+    # 分数来源随类型而异：黑屏用暗像素占比，其余检测器自带 score
+    def _score_of(res):
+        if isinstance(res, dict):
+            if res.get("region"):
+                return min(1.0, float(res["region"].get("dark_pct", 0.0)) / 100.0)
+            if res.get("score") is not None:
+                return min(1.0, float(res["score"]))
+        return 0.0
+
+    best = max(evidence, key=lambda e: _score_of(e[1]))
+    score = round(_score_of(best[1]), 3)
     t0, t1 = evidence[0], evidence[-1]
     span = (f"video {_fmt_ts(t0[3])} ~ {_fmt_ts(t1[3])}" if t0[3] is not None
             else f"{t0[5].strftime('%H:%M:%S.%f')[:-3]} ~ {t1[5].strftime('%H:%M:%S.%f')[:-3]}")
     scr = f"SCREEN {screen_no}/{screen_total} - " if screen_no else ""
-    head_lines = [f"{scr}BLACK SCREEN - MERGED EVIDENCE ({len(evidence)} frames)",
+    head_lines = [f"{scr}{label} - MERGED EVIDENCE ({len(evidence)} frames)",
                   f"Source: {source_name[:60]}   Span: {span}   Score: {score}"]
     for li, txt in enumerate(head_lines):
         cv2.putText(sheet, txt, (14, 36 + 34 * li), cv2.FONT_HERSHEY_SIMPLEX,
@@ -663,7 +712,8 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None,
 
     event = {
         "event_id": eid,
-        "event_type": "black_screen",
+        "event_type": event_type,
+        "event_label": label,
         "source": source_name,
         "screen_no": screen_no or None,
         "screen_total": screen_total,
@@ -676,12 +726,12 @@ def emit_merged_event(evidence, source_name, out_root, seq, notifier=None,
         "capture_time": t0[5].astimezone().isoformat(timespec="milliseconds"),
         "capture_time_end": t1[5].astimezone().isoformat(timespec="milliseconds"),
         "score": score,
-        "bbox": best[1]["region"]["bbox"],
+        "bbox": (best[1].get("region") or {}).get("bbox") or best[1].get("bbox"),
         "screenshot": str(shot),
     }
     (ev_dir / "event.json").write_text(_json.dumps(event, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
-    print(f"  🚨 {'S' + str(screen_no) + ' ' if screen_no else ''}BLACK_SCREEN event "
+    print(f"  🚨 {'S' + str(screen_no) + ' ' if screen_no else ''}{event_type.upper()} event "
           f"({len(evidence)} frames merged) span={span} score={score} -> {eid}")
     if notifier:
         try:

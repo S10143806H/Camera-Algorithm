@@ -50,6 +50,8 @@ from camera_diag import (  # noqa: E402
     run_detect_multi,
 )
 from device_context import DeviceContext  # noqa: E402
+from live_detectors import (ALL_TYPES, BLACK, TYPE_COLORS, TYPE_LABELS,  # noqa: E402
+                            TYPE_SHORT, DetectorBank, normalize_types)
 from device_screen import DeviceScreenManager, pick_device, send_input  # noqa: E402
 from gtmp_link import GtmpLink  # noqa: E402
 from platform_compat import list_cameras, set_auto_exposure  # noqa: E402
@@ -122,16 +124,44 @@ def save_rois(rois, frame_size=None):
         print(f"⚠️ ROI 保存失败: {e}")
 
 
+def _flatten(multi):
+    """把 [(屏号, roi, {类型: 结果})] 摊平成标注函数要的 [(屏号, roi, 结果)]。
+
+    每块屏每个异常类型各占一项，且带上类型的标签与配色，便于同一帧上把
+    黑屏/花屏/闪屏画成不同颜色。正常的类型保留一项（不画框），以便状态栏
+    仍能显示该屏"ok"。
+    """
+    flat = []
+    for no, roi, by_type in multi:
+        abnormal = [(t, r) for t, r in by_type.items() if r["abnormal"]]
+        if not abnormal:
+            flat.append((no, roi, {"abnormal": False, "region": None}))
+            continue
+        for t, r in abnormal:
+            item = dict(r)
+            item["type"] = t
+            item["label"] = TYPE_LABELS.get(t, t.upper())
+            item["short"] = TYPE_SHORT.get(t, t.upper()[:6])
+            item["color"] = TYPE_COLORS.get(t, (0, 0, 255))
+            if t == BLACK and r.get("raw"):
+                item["region"] = (r["raw"] or {}).get("region")
+            flat.append((no, roi, item))
+    return flat
+
+
 # ---------------------------------------------------------------- 监控服务
 class MonitorService:
     """唯一的相机持有者：采集 → 逐屏检测 → 标注 → 编码 JPEG 供 HTTP 取用。"""
 
     def __init__(self, cap, info, max_screens=3, rois=None, detect=True,
-                 notifier=None, jpeg_quality=75):
+                 notifier=None, jpeg_quality=75, types=None):
         self.cap = cap
         self.info = info
         self.max_screens = max(1, max_screens)
         self.detect_on = detect and HAVE_DETECTOR
+        self.types = normalize_types(types)
+        self.bank = DetectorBank(self.types, fps=float(info.get("fps") or 30.0))
+        self.bank.set_rois(rois or [])
         self.notifier = notifier
         self.jpeg_quality = jpeg_quality
 
@@ -149,8 +179,8 @@ class MonitorService:
         self._screen_state = {}
         self._calib_buf = []                  # 滚动标定缓存（每 0.5s 一帧，最多 40）
         self._last_calib_sample = 0.0
-        self.event_root = (ROOT / "diag_captures" /
-                           f"web_{datetime.now().strftime('%Y%m%d')}" / "black_screen")
+        # 事件按 screen_N/<异常类型>/ 分目录，根目录不再写死 black_screen
+        self.event_root = ROOT / "diag_captures" / f"web_{datetime.now().strftime('%Y%m%d')}"
         self.source_name = f"camera_{info.get('idx', '?')}"
         # 掉线自愈：USB 重新枚举后 /dev/videoN 会换号，旧 cap 只会一直读失败
         self.cam_name = info.get("name") or ""
@@ -262,9 +292,10 @@ class MonitorService:
                 rois = list(self.rois)
                 detect_on = self.detect_on
 
-            results = run_detect_multi(frame, rois) if detect_on else []
+            multi = self.bank.run(frame, now) if detect_on else []
             if detect_on:
-                self._gate_events(frame, results, rois)
+                self._gate_events(frame, multi)
+            results = _flatten(multi)          # 供标注与状态接口使用
 
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             display = (annotate_live_multi(frame, results, ts) if results
@@ -293,27 +324,42 @@ class MonitorService:
         _put_text_clamped(out, ts, 12, out.shape[0] - 40, 0.7, (0, 215, 255))
         return out
 
-    def _gate_events(self, frame, results, rois):
-        """逐屏事件门控：连续命中攒够证据帧 → 落盘一次合并事件 → 进入冷却。"""
+    def _gate_events(self, frame, multi):
+        """逐屏 × 逐类型独立门控：连续命中攒够证据帧 → 落盘事件 → 进入冷却。
+
+        状态按 (屏号, 类型) 分开：同一块屏的花屏和黑屏互不干扰，一种异常的冷却
+        窗口不会把另一种吞掉。
+        """
         wc = datetime.now()
         ts = wc.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         cur = time.time()
-        for no, roi, r in results:
-            st = self._state_of(no)
-            if r["abnormal"]:
-                st["streak"] += 1
-                if cur >= st["cooldown_until"] and cur - st["last_evi_t"] >= EVIDENCE_GAP:
-                    st["evidence"].append((frame.copy(), r, ts, None, None, wc))
-                    st["last_evi_t"] = cur
-                    if len(st["evidence"]) >= EVIDENCE_N:
-                        self._emit(st, no, roi, len(results))
-            else:
-                if len(st["evidence"]) >= EVIDENCE_MIN and cur >= st["cooldown_until"]:
-                    self._emit(st, no, roi, len(results))
-                st["evidence"] = []
-                st["streak"] = 0
+        total = len(multi)
+        for no, roi, by_type in multi:
+            for typ, r in by_type.items():
+                st = self._state_of((no, typ))
+                # 证据里带上类型标签/配色，事件图才不会一律画成黑屏样式
+                payload = dict(r.get("raw") or r)
+                payload["type"] = typ
+                payload["label"] = TYPE_LABELS.get(typ, typ.upper())
+                payload["color"] = TYPE_COLORS.get(typ, (0, 0, 255))
+                payload["short"] = TYPE_SHORT.get(typ, typ.upper()[:6])
+                if typ != BLACK:
+                    payload.pop("region", None)
+                if r["abnormal"]:
+                    st["streak"] += 1
+                    if cur >= st["cooldown_until"] and cur - st["last_evi_t"] >= EVIDENCE_GAP:
+                        st["evidence"].append((frame.copy(), payload, ts, None, None, wc))
+                        st["last_evi_t"] = cur
+                        if len(st["evidence"]) >= EVIDENCE_N:
+                            self._emit(st, no, roi, total, typ)
+                else:
+                    if (len(st["evidence"]) >= EVIDENCE_MIN
+                            and cur >= st["cooldown_until"]):
+                        self._emit(st, no, roi, total, typ)
+                    st["evidence"] = []
+                    st["streak"] = 0
 
-    def _emit(self, st, no, roi, total):
+    def _emit(self, st, no, roi, total, typ=BLACK):
         self.event_seq += 1
         evidence, seq = st["evidence"], self.event_seq
         st["evidence"] = []
@@ -323,7 +369,9 @@ class MonitorService:
             try:
                 ev = emit_merged_event(evidence, self.source_name, self.event_root, seq,
                                        notifier=self.notifier, screen_no=no,
-                                       screen_roi=roi, screen_total=total)
+                                       screen_roi=roi, screen_total=total,
+                                       event_type=typ,
+                                       label=TYPE_LABELS.get(typ, typ.upper()))
                 enrich_event(ev, no)          # 附加设备归因与 GTMP 任务上下文
                 with self.lock:
                     self.events.append(ev)
@@ -357,6 +405,8 @@ class MonitorService:
             self.rois = rois
             self.results = []
             self._screen_state.clear()
+        # 闪屏/冻屏检测器带历史，换了 ROI 必须重建，否则拿旧屏历史判新屏
+        self.bank.set_rois(rois)
         save_rois(rois, self.frame_size())
         return rois
 
@@ -397,13 +447,23 @@ class MonitorService:
         with self.lock:
             results, rois = list(self.results), list(self.rois)
             n_events = len(self.events)
-        screens = [{"no": no,
-                    "roi": list(roi) if roi else None,
-                    "abnormal": bool(r["abnormal"]),
-                    "dark_pct": round(float(r["region"]["dark_pct"]), 1) if r.get("region") else 0.0}
-                   for no, roi, r in results]
+        screens = []
+        for no, roi, res in results:
+            hit = res.get("abnormal") and (res.get("label") or "")
+            screens.append({
+                "no": no,
+                "roi": list(roi) if roi else None,
+                "type": (res.get("type") or ""),
+                "label": res.get("label") or "",
+                "abnormal": bool(res.get("abnormal")),
+                "score": float(res.get("score") or 0.0),
+                "info": res.get("info") or "",
+                "dark_pct": round(float((res.get("region") or {}).get("dark_pct", 0.0)), 1),
+            })
         return {
             "device": self.info.get("idx"),
+            "types": list(self.types),
+            "type_labels": {t: TYPE_LABELS.get(t, t) for t in self.types},
             "camera_online": self.cam_online,
             "camera_status": self.cam_status,
             "camera_reconnects": self.reconnects,
@@ -702,6 +762,12 @@ def main():
                          "screencap=直接用轮询（慢但从第一帧就保证对得上）")
     ap.add_argument("--no-device-context", action="store_true",
                     help="不采集设备状态与 logcat（默认开启，用于黑屏归因）")
+    ap.add_argument("--types", default=BLACK,
+                    help="启用的异常类型，逗号分隔或 all。默认只开 black_screen——"
+                         "实测台架待机时 screen_freeze 会在所有屏 100% 命中"
+                         "（待机画面本就静止），white_screen 也会在白底页面上常驻，"
+                         "其余类型请按台架实际情况按需开启。可选: "
+                         + ", ".join(ALL_TYPES))
     ap.add_argument("--width", type=int, default=1280,
                     help="固定采集宽度（默认1280；ROI 与分辨率绑定，别随意改）")
     ap.add_argument("--height", type=int, default=720, help="固定采集高度（默认720）")
@@ -745,7 +811,9 @@ def main():
 
     service = MonitorService(cap, info, max_screens=args.screens, rois=rois,
                              detect=not args.no_detect, notifier=notifier,
-                             jpeg_quality=args.quality)
+                             jpeg_quality=args.quality, types=args.types)
+    print("🔎 启用检测: " + ", ".join(
+        f"{TYPE_LABELS.get(t, t)}({t})" for t in service.types))
     service.start()
 
     if not args.no_device_screen:

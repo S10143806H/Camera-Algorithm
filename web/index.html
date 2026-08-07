@@ -97,6 +97,7 @@
   <span class="pill" id="p-fps">— fps</span>
   <span class="pill" id="p-detect">检测 —</span>
   <span class="pill" id="p-alert">告警 —</span>
+  <span class="pill" id="p-types">检测类型 —</span>
 </header>
 
 <main>
@@ -322,21 +323,33 @@ async function poll(){
     : `⚠ ${s.camera_status || '相机掉线'}`;
   $('#p-dev').className = 'pill ' + (online ? '' : 'bad');
   $('#p-fps').textContent = `${s.fps} fps`;
+  $('#p-types').textContent = '检测: ' + (s.types || []).map(t => (s.type_labels || {})[t] || t).join(' · ');
   const d = $('#p-detect');
   d.textContent = '检测 ' + (s.detect_on ? '开' : '关');
   d.className = 'pill ' + (s.detect_on ? 'ok' : '');
-  const bad = s.screens.filter(x => x.abnormal).map(x => 'S' + x.no);
+  const bad = s.screens.filter(x => x.abnormal).map(x => `S${x.no}:${x.short || x.label || ''}`);
   const a = $('#p-alert');
   a.textContent = bad.length ? '告警 ' + bad.join(',') : '告警 无';
   a.className = 'pill ' + (bad.length ? 'bad' : 'ok');
 
+  // 一块屏可能同时命中多种异常，按屏聚合后再列出类型
+  const byScreen = new Map();
+  s.screens.forEach(x => {
+    const k = x.no;
+    if (!byScreen.has(k)) byScreen.set(k, {no: x.no, roi: x.roi, hits: []});
+    if (x.abnormal) byScreen.get(k).hits.push(x);
+  });
   const tb = $('#screens').querySelector('tbody');
-  tb.innerHTML = s.screens.length
-    ? '<tr><th>屏幕</th><th>状态</th><th>暗像素</th><th>ROI</th></tr>' + s.screens.map(x => `
-        <tr><td><span class="sn ${x.abnormal ? 'bad' : 'ok'}">S${x.no || '全'}</span></td>
-            <td>${x.abnormal ? '<b style="color:var(--bad)">BLACK</b>' : 'ok'}</td>
-            <td>${x.dark_pct}%</td>
-            <td style="color:var(--dim)">${x.roi ? x.roi.join(',') : '整幅画面'}</td></tr>`).join('')
+  tb.innerHTML = byScreen.size
+    ? '<tr><th>屏幕</th><th>状态</th><th>详情</th><th>ROI</th></tr>' + [...byScreen.values()].map(g => {
+        const bad = g.hits.length > 0;
+        const names = g.hits.map(h => h.label || h.type).join(' + ');
+        const detail = g.hits.map(h => h.info || `score ${h.score}`).join('; ');
+        return `<tr><td><span class="sn ${bad ? 'bad' : 'ok'}">S${g.no || '全'}</span></td>
+            <td>${bad ? `<b style="color:var(--bad)">${names}</b>` : 'ok'}</td>
+            <td style="color:var(--dim)">${detail || '—'}</td>
+            <td style="color:var(--dim)">${g.roi ? g.roi.join(',') : '整幅画面'}</td></tr>`;
+      }).join('')
     : '<tr><td class="empty">未标定 ROI，按整幅画面检测</td></tr>';
   $('#roi-arg').innerHTML = s.roi_arg
     ? `命令行参数：<code>--roi ${s.roi_arg}</code>` : '未设置 ROI';

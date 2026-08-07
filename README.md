@@ -259,6 +259,7 @@ export QT_QPA_PLATFORM=xcb                         # Wayland 下预览窗口异�
 | `--port` / `--host` | `web_monitor` | 监听端口 / 地址，默认 `0.0.0.0:8000` |
 | `--quality N` | `web_monitor` | MJPEG 质量 1–100，默认 75；带宽紧张可调低 |
 | `--width` / `--height` | `web_monitor` | 固定采集分辨率，默认 `1280x720`。**ROI 是像素坐标，与分辨率绑定，别随意改** |
+| `--types` | `web_monitor` | 启用的异常类型，逗号分隔或 `all`。默认只开 `black_screen`，原因见下 |
 | `--no-device-screen` | `web_monitor` | 关掉设备投屏（默认自动探测 adb 设备） |
 | `--adb-serial S` | `web_monitor` | 多台设备时指定序列号 |
 | `--device-displays` | `web_monitor` | 手动指定投屏的 display-id 及顺序（逗号分隔），缺省按 port 自动枚举 |
@@ -327,6 +328,37 @@ python3 web_monitor.py --device 0 --screens 3        # 默认 0.0.0.0:8000
 | 面板折叠 | 四个面板（实时画面/屏幕状态/相机参数/事件）点标题栏即可折叠，状态存 localStorage，刷新后保持 |
 
 ROI 会存到 `screen_rois.json`，服务重启后自动载入。
+
+### 实时可检测的异常类型
+
+原本只有黑屏跑在实时链路上，其余四类只能离线跑视频文件。现在五类共用同一套
+实时检测组（`live_detectors.py`），**同一块屏可同时命中多种异常**，事件按
+`screen_N/<类型>/` 分目录归档，画面上按类型配色。
+
+```bash
+python3 web_monitor.py --types black_screen                    # 默认
+python3 web_monitor.py --types black_screen,screen_distorted   # 加花屏
+python3 web_monitor.py --types all                             # 全开
+```
+
+| 类型 | 代号 | 画面配色 | 说明 |
+|---|---|---|---|
+| `black_screen` | BLACK | 红 | 默认开启 |
+| `white_screen` | WHITE | 棕 | 屏幕整片发白 |
+| `screen_flicking` | FLICK | 黄 | 亮度反复跳变 |
+| `screen_distorted` | GARBLE | 品红 | 花屏 / 马赛克 / 高频噪点 |
+| `screen_freeze` | FREEZE | 青 | 画面长时间完全静止 |
+
+> **默认只开黑屏是有原因的。** 实测在待机的车机台架上全开会刷屏误报：
+> `screen_freeze` 在三块屏上 **100% 命中**（待机画面本来就静止），
+> `white_screen` 在显示白底页面的那块屏上常驻命中 —— 一分钟就生成 26 个事件、
+> 344MB 证据。这两类的语义依赖"这块屏此刻本该在动 / 本该有内容"，
+> 需按台架实际用途按需开启。花屏与闪屏没有这个问题。
+
+**花屏判据已放宽**：原先要求同一网格"梯度达标 **且** 高饱和度达标"，实测灰度
+噪点型花屏会整段漏检（240/240 网格梯度超阈，但只有 3 个网格饱和度达标 → 一帧
+不报）。改为"梯度达标，且（颜色异常 **或** 梯度极强）"后，同一段样本命中
+60/60 帧，彩色型花屏的结果不变，正常画面仍零误报。
 
 ### 设备投屏
 
