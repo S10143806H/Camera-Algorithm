@@ -117,7 +117,10 @@
           <button id="btn-cancel" disabled>取消</button>
           <button class="danger" id="btn-clear">清除 ROI</button>
           <button id="btn-detect">检测开关</button>
+          <button id="btn-notify">飞书提醒 —</button>
+          <button id="btn-notify-test">发测试消息</button>
         </div>
+        <div class="hint" id="notify-hint" hidden></div>
         <div class="hint" id="hint">
           点「框选 ROI」后在画面上拖框，每拖一次添加一块屏幕，点「应用」生效。
         </div>
@@ -290,6 +293,32 @@ $('#btn-clear').onclick = async () => { await api('/api/rois', 'DELETE'); poll()
 $('#btn-detect').onclick = async () => {
   const s = await api('/api/status');
   await api('/api/detect', 'POST', {on: !s.detect_on}); poll();
+};
+
+/* ---------- 飞书提醒开关 ---------- */
+function renderNotify(n){
+  const b = $('#btn-notify'), t = $('#btn-notify-test'), h = $('#notify-hint');
+  b.textContent = '飞书提醒 ' + (n.on ? '开' : '关');
+  b.classList.toggle('primary', !!n.on);
+  b.disabled = !n.available && !n.on;   // 未配置时只允许关，不允许开
+  t.disabled = !n.available;
+  h.hidden = n.available;
+  if (!n.available) h.textContent = '飞书提醒不可用：' + (n.problem || '未配置');
+  else h.textContent = '';
+}
+async function loadNotify(){
+  try { renderNotify(await api('/api/notify')); } catch {}
+}
+$('#btn-notify').onclick = async () => {
+  const cur = $('#btn-notify').textContent.includes('开');
+  try { renderNotify(await api('/api/notify', 'POST', {on: !cur})); }
+  catch (e) { alert('切换失败: ' + e.message); }
+};
+$('#btn-notify-test').onclick = async () => {
+  const t = $('#btn-notify-test'); t.disabled = true;
+  try { await api('/api/notify/test', 'POST'); alert('已发送，去飞书群里确认'); }
+  catch (e) { alert('发送失败: ' + e.message); }
+  t.disabled = false; loadNotify();
 };
 
 /* ---------- 相机参数 ---------- */
@@ -575,7 +604,8 @@ $('#events').addEventListener('click', e => {
 
 addEventListener('resize', fitCanvas);
 video.addEventListener('load', fitCanvas);
-initFolding(); refreshSelUI(); loadParams(); poll(); pollEvents(); pollDevice();
+initFolding(); refreshSelUI(); loadParams(); loadNotify();
+poll(); pollEvents(); pollDevice();
 setInterval(poll, 1000);
 setInterval(pollEvents, 5000);
 setInterval(pollDevice, 2000);

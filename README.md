@@ -337,6 +337,7 @@ python3 web_monitor.py --device 0 --screens 3        # 默认 0.0.0.0:8000
 | 相机参数 | 亮度/对比度/饱和度/增益/曝光/自动曝光，滑动即生效 |
 | **预览变焦** | `Zoom` 1.00x~4.00x 数字变焦 + `Pan X/Y` 移动放大中心，看屏幕细节用；**只放大预览，检测始终跑完整画面**，所以放大时取景框外的屏幕不会漏检。放大期间框选 / 自动标定会自动禁用（叠加层坐标与放大画面对不上），拉回 1.00x 即恢复 |
 | **设备投屏** | 相机画面下方并排显示 Android 设备的每块物理屏，**路数跟随相机能检测的屏幕数**；对照"设备以为在显示什么"与"相机实际看到什么" |
+| **飞书提醒** | 工具栏「飞书提醒」按钮随时开关，**不用重启服务**；「发测试消息」验证配置。未配置时按钮置灰并直接写出缺哪一项 |
 | 事件列表 | 每 5 秒刷新，含证据截图、屏幕编号、score；**点击截图看大图**（ESC 关闭，可新标签页打开原图） |
 | 面板折叠 | 四个面板（实时画面/屏幕状态/相机参数/事件）点标题栏即可折叠，状态存 localStorage，刷新后保持 |
 
@@ -490,6 +491,8 @@ python3 web_monitor.py --no-device-screen          # 不需要投屏时关掉
 | POST | `/api/rois/calibrate` | 自动标定多屏 |
 | GET/POST | `/api/camera` | 读取 / 设置相机参数 |
 | POST | `/api/detect` | 检测开关 |
+| GET/POST | `/api/notify` | 飞书提醒开关（`available=false` 时附带缺什么配置） |
+| POST | `/api/notify/test` | 发一条飞书测试消息，验证配置能否送达 |
 | GET | `/api/events` | 事件列表 |
 | GET | `/api/events/{id}/screenshot` | 事件证据截图 |
 | GET | `/device_stream/{i}` | 第 i 块设备屏的 MJPEG 流（i 从 0 起） |
@@ -671,14 +674,53 @@ python3 web_monitor.py --gtmp-bench 12      # 自动跟踪该台架运行中的�
 
 ## 飞书告警（可选）
 
+两条路二选一，配好后**网页「实时画面」工具栏上的「飞书提醒」按钮即可随时开关**，
+不必重启服务；旁边的「发测试消息」用于确认配置真能送达。
+
+### 方式一：群自定义机器人（最省事）
+
+群设置 → 群机器人 → 添加「自定义机器人」，拿到 webhook URL：
+
 ```bash
-cp set_feishu_env.sh.example set_feishu_env.sh
-# 编辑填入 webhook 后
-source set_feishu_env.sh
+export FEISHU_WEBHOOK="https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
+export FEISHU_WEBHOOK_SECRET="签名密钥"     # 机器人开了「签名校验」才需要
 python3 notify/feishu_notifier.py --test
 ```
 
-检测时加 `--notify` 即在生成事件后推送卡片。`set_feishu_env.sh` 已被 `.gitignore` 忽略。
+### 方式二：企业自建应用往指定群发
+
+已有应用时用这条。需要三样东西**同时**具备：
+
+| 需要 | 从哪来 |
+|---|---|
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 开放平台 → 应用 → 凭证与基础信息 |
+| `FEISHU_CHAT_ID`（`oc_` 开头） | 目标群的 chat_id |
+| 权限 `im:message:send_as_bot` + **把该应用加进这个群** | 应用后台申请权限并发布版本；群里「添加机器人」选这个应用 |
+
+> `oc_` 开头的 chat_id 只是**收件地址，不是凭证**，单有它发不出去。
+
+```bash
+export FEISHU_APP_ID="cli_xxx"
+export FEISHU_APP_SECRET="xxx"
+export FEISHU_CHAT_ID="oc_xxx"
+python3 notify/feishu_notifier.py --test
+```
+
+两种方式都配了时优先走 webhook。`FEISHU_APP_ID/SECRET` 另有一个用途：
+卡片里内嵌证据截图（权限 `im:resource`），没配就降级为纯文字卡片。
+
+### 开机自启时怎么给凭证
+
+systemd 服务读 `~/.config/screen-monitor.env`（`EnvironmentFile=-%h/.config/screen-monitor.env`，
+文件不存在也不影响启动）。凭证写在这里，不会进 git：
+
+```bash
+chmod 600 ~/.config/screen-monitor.env
+systemctl --user restart screen-monitor
+curl -s localhost:8000/api/notify        # available=true 即配置就绪
+```
+
+命令行加 `--notify` 只决定**启动时**的初值，之后以网页开关为准。
 
 ---
 

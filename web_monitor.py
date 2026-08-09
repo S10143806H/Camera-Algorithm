@@ -174,7 +174,7 @@ class MonitorService:
     """唯一的相机持有者：采集 → 逐屏检测 → 标注 → 编码 JPEG 供 HTTP 取用。"""
 
     def __init__(self, cap, info, max_screens=3, rois=None, detect=True,
-                 notifier=None, jpeg_quality=75, types=None):
+                 notifier=None, jpeg_quality=75, types=None, notify_on=False):
         self.cap = cap
         self.info = info
         self.max_screens = max(1, max_screens)
@@ -182,7 +182,10 @@ class MonitorService:
         self.types = normalize_types(types)
         self.bank = DetectorBank(self.types, fps=float(info.get("fps") or 30.0))
         self.bank.set_rois(rois or [])
-        self.notifier = notifier
+        # 发送函数始终持有（只要模块导入成功），开关只控制发不发，
+        # 这样网页上可以随时开启，不必重启服务改命令行
+        self._notify_fn = notifier
+        self.notify_on = bool(notifier) and notify_on
         self.jpeg_quality = jpeg_quality
 
         self.lock = threading.Lock()          # 保护 _jpeg / _raw / results / rois
@@ -210,6 +213,18 @@ class MonitorService:
         self.cam_online = True
         self.reconnects = 0
         self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    # ---------------------------------------------------------- 飞书告警
+    @property
+    def notifier(self):
+        return self._notify_fn if self.notify_on else None
+
+    def set_notify(self, on):
+        if on and not self._notify_fn:
+            raise RuntimeError("飞书告警模块不可用，无法开启")
+        self.notify_on = bool(on)
+        print(f"📨 飞书告警 -> {'开' if self.notify_on else '关'}")
+        return self.notify_on
 
     # ---------------------------------------------------------- 生命周期
     def start(self):
@@ -585,6 +600,10 @@ class DetectIn(BaseModel):
     on: bool
 
 
+class NotifyIn(BaseModel):
+    on: bool
+
+
 class InputIn(BaseModel):
     action: str                       # tap / swipe / key / text
     x: float = None                   # 归一化 0~1，浏览器画面是缩放的
@@ -610,6 +629,47 @@ async def stream():
 @app.get("/api/status")
 def api_status():
     return service.status()
+
+
+def _notify_state():
+    """飞书告警的可用性与开关状态，供网页按钮渲染。"""
+    try:
+        from notify.feishu_notifier import config_status
+        cfg = config_status()
+    except Exception as e:                      # noqa: BLE001
+        cfg = {"mode": None, "ready": False, "target": None, "problem": str(e)}
+    available = bool(service and service._notify_fn) and cfg["ready"]
+    return {"available": available, "on": bool(service and service.notify_on),
+            "mode": cfg["mode"], "target": cfg["target"], "problem": cfg["problem"]}
+
+
+@app.get("/api/notify")
+def api_notify_get():
+    return _notify_state()
+
+
+@app.post("/api/notify")
+def api_notify_set(body: NotifyIn):
+    st = _notify_state()
+    if body.on and not st["available"]:
+        raise HTTPException(409, st["problem"] or "飞书告警未配置")
+    service.set_notify(body.on)
+    return _notify_state()
+
+
+@app.post("/api/notify/test")
+def api_notify_test():
+    """发一条测试消息，确认配置真的能送达（不依赖开关，也不产生事件）。"""
+    st = _notify_state()
+    if not st["available"]:
+        raise HTTPException(409, st["problem"] or "飞书告警未配置")
+    from notify.feishu_notifier import send_text
+    try:
+        send_text(f"✅ 屏幕异常监控测试消息 "
+                  f"{datetime.now():%Y-%m-%d %H:%M:%S} · 相机 {service.info.get('idx')}")
+    except Exception as e:                      # noqa: BLE001
+        raise HTTPException(502, f"发送失败: {e}")
+    return {"ok": True, **st}
 
 
 @app.get("/api/rois")
@@ -862,18 +922,23 @@ def main():
     if rois:
         print(f"🖥️ 载入 ROI ({len(rois)} 块): {format_rois(rois)}")
 
-    notifier = None
-    if args.notify:
-        try:
-            from notify.feishu_notifier import send_event
-            notifier = send_event
-            print("📨 飞书告警: 开")
-        except Exception as e:
-            print(f"⚠️ 飞书告警不可用: {e}")
+    # 发送函数总是加载，网页上随时可开关；--notify 只决定启动时的初值
+    notifier, notify_cfg = None, None
+    try:
+        from notify.feishu_notifier import config_status, send_event
+        notifier, notify_cfg = send_event, config_status()
+    except Exception as e:                      # noqa: BLE001
+        print(f"⚠️ 飞书告警模块不可用: {e}")
+    if notify_cfg and notify_cfg["ready"]:
+        print(f"📨 飞书告警: {'开' if args.notify else '关（网页上可随时打开）'}"
+              f" · {notify_cfg['mode']} → {notify_cfg['target']}")
+    elif notify_cfg:
+        print(f"📨 飞书告警: 未配置 — {notify_cfg['problem']}")
 
     service = MonitorService(cap, info, max_screens=args.screens, rois=rois,
                              detect=not args.no_detect, notifier=notifier,
-                             jpeg_quality=args.quality, types=args.types)
+                             jpeg_quality=args.quality, types=args.types,
+                             notify_on=args.notify)
     print("🔎 启用检测: " + ", ".join(
         f"{TYPE_LABELS.get(t, t)}({t})" for t in service.types))
     service.start()

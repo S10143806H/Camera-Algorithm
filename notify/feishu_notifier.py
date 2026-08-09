@@ -10,6 +10,10 @@ Webhook 从环境变量读取，绝不硬编码：
   export FEISHU_APP_ID="cli_xxx"
   export FEISHU_APP_SECRET="xxx"
 
+  # 另一条路: 不用群机器人 webhook, 直接用应用往指定群发消息
+  # (需权限 im:message:send_as_bot, 且把该应用拉进这个群)
+  export FEISHU_CHAT_ID="oc_xxxx"
+
   # Windows PowerShell
   $env:FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
   $env:FEISHU_WEBHOOK_SECRET = "签名密钥"
@@ -45,6 +49,7 @@ from datetime import datetime
 
 ENV_WEBHOOK = "FEISHU_WEBHOOK"
 ENV_SECRET = "FEISHU_WEBHOOK_SECRET"
+ENV_CHAT_ID = "FEISHU_CHAT_ID"
 TIMEOUT_S = 10
 RETRIES = 2
 
@@ -74,7 +79,76 @@ def _sign_fields():
     return {"timestamp": ts, "sign": base64.b64encode(digest).decode("utf-8")}
 
 
+def config_status():
+    """当前可用的发送方式。返回 {mode, target, ready, problem}。
+
+    两条路二选一：
+      webhook —— 群里加「自定义机器人」，只需一个 URL，最省事
+      app     —— 企业自建应用往指定群（chat_id）发，需要 app_id/app_secret，
+                 且应用要被拉进该群、有 im:message:send_as_bot 权限
+    只有 chat_id 而没有应用凭证是发不出去的：chat_id 只是收件地址，不是凭证。
+    """
+    hook = os.environ.get(ENV_WEBHOOK, "").strip()
+    if hook:
+        tail = hook.rsplit("/", 1)[-1]
+        return {"mode": "webhook", "ready": True,
+                "target": f"…{tail[-6:]}" if len(tail) > 6 else tail, "problem": None}
+
+    chat = os.environ.get(ENV_CHAT_ID, "").strip()
+    app_id = os.environ.get(ENV_APP_ID, "").strip()
+    app_secret = os.environ.get(ENV_APP_SECRET, "").strip()
+    if chat and app_id and app_secret:
+        return {"mode": "app", "ready": True, "target": chat, "problem": None}
+
+    if chat and not (app_id and app_secret):
+        return {"mode": "app", "ready": False, "target": chat,
+                "problem": f"已配置群 {chat}，但缺 {ENV_APP_ID}/{ENV_APP_SECRET}；"
+                           f"chat_id 只是收件地址，还需要应用凭证才能发送"}
+    return {"mode": None, "ready": False, "target": None,
+            "problem": f"未配置 {ENV_WEBHOOK}（群自定义机器人 URL），"
+                       f"也未配置 {ENV_APP_ID}/{ENV_APP_SECRET}+{ENV_CHAT_ID}"}
+
+
+def _post_via_app(payload, dry_run=False):
+    """用应用凭证往 chat_id 发。与 webhook 的报文结构不同：
+    content 必须是 JSON 字符串，且 receive_id 走 query 参数指定类型。"""
+    chat = os.environ.get(ENV_CHAT_ID, "").strip()
+    msg_type = payload.get("msg_type", "text")
+    content = payload.get("card") if msg_type == "interactive" else payload.get("content")
+    body_obj = {"receive_id": chat, "msg_type": msg_type,
+                "content": json.dumps(content, ensure_ascii=False)}
+    if dry_run:
+        print("[dry-run] im/v1/messages payload:")
+        print(json.dumps(body_obj, ensure_ascii=False, indent=2))
+        return {"code": 0, "dry_run": True}
+
+    token = _tenant_token()
+    if token is None:
+        raise FeishuError(f"未配置 {ENV_APP_ID}/{ENV_APP_SECRET}，无法用 chat_id 发送")
+    last_err = None
+    for attempt in range(1 + RETRIES):
+        try:
+            req = urllib.request.Request(
+                "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+                data=json.dumps(body_obj, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8",
+                         "Authorization": f"Bearer {token}"})
+            data = _read_json(req, TIMEOUT_S)
+            if data.get("code") == 0:
+                return data
+            raise FeishuError(f"飞书返回错误: {data}")
+        except (urllib.error.URLError, TimeoutError, FeishuError) as e:
+            last_err = e
+            if attempt < RETRIES:
+                time.sleep(1.5 * (attempt + 1))
+    raise FeishuError(f"发送失败(已重试{RETRIES}次): {last_err}")
+
+
 def _post(payload, dry_run=False):
+    if not os.environ.get(ENV_WEBHOOK, "").strip() \
+            and os.environ.get(ENV_CHAT_ID, "").strip():
+        return _post_via_app(payload, dry_run=dry_run)
+
     payload = {**_sign_fields(), **payload}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if dry_run:
