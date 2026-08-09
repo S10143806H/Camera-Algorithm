@@ -39,6 +39,13 @@ KEY_LOG_RE = re.compile(
     r"SurfaceFlinger.*(?:blank|power|display)|Watchdog|ANR in|FATAL EXCEPTION|"
     r"system_server.*died|init:.*(?:reboot|shutdown)", re.I)
 
+# 交给设备侧先过滤：车机实测 logcat 全量约 2 万行/秒，若整股流都进 Python 逐行
+# 跑正则，这一个线程就能占满一个核并抢走 GIL，相机采集会从 25fps 掉到 <1fps。
+# logcat -e 在设备侧完成筛选，Python 只收到几十行/分钟。
+KEY_LOG_GREP = ("ShutdownThread|boot_progress|sys\\.boot_completed|BootReceiver|"
+                "DisplayPowerController|setDisplayState|PowerManagerService|"
+                "SurfaceFlinger|Watchdog|ANR in|FATAL EXCEPTION|died|reboot|shutdown")
+
 
 def _adb(serial, *args, timeout=15, text=True):
     cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
@@ -122,11 +129,16 @@ class DeviceContext:
 
     def _log_loop(self):
         """常驻 logcat 流，只保留与重启/显示相关的行，避免缓冲被刷爆。"""
+        use_filter = True                      # -e 不被支持时退回全量流
         while self.running:
             proc = None
+            started = time.time()
             try:
+                # -T 1: 只跟新行，不回放整个环形缓冲（回放一次就是几十万行）
+                # -e:   设备侧先过滤，别把全量日志拉过 USB 再用 Python 逐行判
                 cmd = ["adb"] + (["-s", self.serial] if self.serial else []) + \
-                      ["logcat", "-v", "threadtime"]
+                      ["logcat", "-v", "threadtime", "-T", "1"] + \
+                      (["-e", KEY_LOG_GREP] if use_filter else [])
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
                 for line in proc.stdout:
@@ -138,9 +150,14 @@ class DeviceContext:
             except Exception:
                 pass
             finally:
-                if proc and proc.poll() is None:
+                rc = proc.poll() if proc else None
+                if proc and rc is None:
                     try: proc.kill()
                     except Exception: pass
+            # 立刻退出且是非零码，多半是这台设备的 logcat 不认 -e
+            if use_filter and rc not in (None, 0) and time.time() - started < 2.0:
+                use_filter = False
+                print("⚠️ 设备 logcat 不支持 -e，退回全量流（CPU 占用会明显升高）")
             if self.running:
                 time.sleep(3.0)
 

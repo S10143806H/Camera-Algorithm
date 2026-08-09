@@ -149,6 +149,26 @@ def _flatten(multi):
     return flat
 
 
+# ---------------------------------------------------------------- 数字变焦
+# 相机参数里的 Zoom 只作用于预览画面：裁一块再放回原尺寸。
+# 不动检测输入是有意为之——放大到 2x 后另外两块屏就在取景框外了，
+# 若检测也跟着放大，它们的 ROI 会立刻退化成空区域并连报黑屏。
+ZOOM_MIN, ZOOM_MAX = 100, 400        # 百分比，1.00x ~ 4.00x
+
+
+def _apply_zoom(img, zoom, cx, cy):
+    """按 zoom 倍率、以 (cx, cy) 归一化中心裁剪并放回原尺寸。"""
+    z = max(1.0, float(zoom))
+    if z <= 1.0 + 1e-6:
+        return img
+    h, w = img.shape[:2]
+    cw, ch = max(16, int(w / z)), max(16, int(h / z))
+    x0 = min(max(int(cx * w - cw / 2), 0), w - cw)
+    y0 = min(max(int(cy * h - ch / 2), 0), h - ch)
+    crop = img[y0:y0 + ch, x0:x0 + cw]
+    return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 # ---------------------------------------------------------------- 监控服务
 class MonitorService:
     """唯一的相机持有者：采集 → 逐屏检测 → 标注 → 编码 JPEG 供 HTTP 取用。"""
@@ -173,6 +193,8 @@ class MonitorService:
         self.results = []
         self.fps = 0.0
         self.running = True
+        self.zoom = 100                       # 预览数字变焦，百分比
+        self.pan = [50, 50]                   # 变焦中心，百分比
 
         self.events = []                      # 最近事件（内存），完整证据在磁盘
         self.event_seq = 0
@@ -300,6 +322,10 @@ class MonitorService:
             ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             display = (annotate_live_multi(frame, results, ts) if results
                        else self._plain(frame, rois, ts))
+            with self.lock:
+                zoom, (px, py) = self.zoom, self.pan
+            if zoom > 100:
+                display = _apply_zoom(display, zoom / 100.0, px / 100.0, py / 100.0)
 
             ok, buf = cv2.imencode(".jpg", display, enc)
             if not ok:
@@ -430,11 +456,27 @@ class MonitorService:
             out.append({"name": name, "value": val, "max": vmax})
         ae = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
         out.append({"name": "AutoExp 0/1", "value": 0 if ae in (0, 1, 0.25) else 1, "max": 1})
+        with self.lock:
+            zoom, (px, py) = self.zoom, list(self.pan)
+        out.append({"name": "Zoom", "value": zoom, "min": ZOOM_MIN, "max": ZOOM_MAX,
+                    "step": 10, "div": 100, "digits": 2, "unit": "x"})
+        out.append({"name": "Pan X", "value": px, "max": 100, "unit": "%",
+                    "needs_zoom": True})
+        out.append({"name": "Pan Y", "value": py, "max": 100, "unit": "%",
+                    "needs_zoom": True})
         return out
 
     def set_camera_param(self, name, value):
         if name == "AutoExp 0/1":
             set_auto_exposure(self.cap, bool(int(value)))
+            return True
+        if name in ("Zoom", "Pan X", "Pan Y"):
+            v = int(value)
+            with self.lock:
+                if name == "Zoom":
+                    self.zoom = min(max(v, ZOOM_MIN), ZOOM_MAX)
+                else:
+                    self.pan[0 if name == "Pan X" else 1] = min(max(v, 0), 100)
             return True
         for pname, prop, vmax, conv in CAM_PARAMS:
             if pname == name:
@@ -464,6 +506,7 @@ class MonitorService:
             "device": self.info.get("idx"),
             "types": list(self.types),
             "type_labels": {t: TYPE_LABELS.get(t, t) for t in self.types},
+            "zoom": self.zoom,
             "camera_online": self.cam_online,
             "camera_status": self.cam_status,
             "camera_reconnects": self.reconnects,

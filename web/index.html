@@ -157,7 +157,13 @@
       <h2>相机参数<span class="chev">▾</span></h2>
       <div class="fold">
         <div class="body" id="params"><div class="empty">加载中…</div></div>
-        <div class="hint">黑屏检测建议：AutoExp 设 0（手动）后固定 Exposure，Gain 调低。</div>
+        <div class="hint">
+          <div>黑屏检测建议：AutoExp 设 0（手动）后固定 Exposure，Gain 调低。</div>
+          <div>Zoom 为数字变焦，只放大预览便于看细节；检测始终跑在完整画面上，
+               所以放大时不会漏掉取景框外的屏幕。Pan X/Y 移动放大中心。</div>
+          <div id="zoom-tip" hidden style="color:var(--warn,#ffd93d)">
+            已放大预览，框选 / 自动标定暂不可用，把 Zoom 拉回 1.00x 即可恢复。</div>
+        </div>
       </div>
     </div>
 
@@ -184,7 +190,7 @@
 const $ = s => document.querySelector(s);
 const video = $('#video'), cv = $('#overlay'), ctx = cv.getContext('2d');
 
-let state = {rois: [], screens: [], w: 0, h: 0};
+let state = {rois: [], screens: [], w: 0, h: 0, zoom: 100};
 let selecting = false, drawing = false, pending = [], p0 = null, p1 = null;
 
 /* ---------- 画布与图像坐标互转（画面按宽度自适应缩放） ---------- */
@@ -287,21 +293,45 @@ $('#btn-detect').onclick = async () => {
 };
 
 /* ---------- 相机参数 ---------- */
+const fmtParam = p => v =>
+  (p.div ? (v / p.div).toFixed(p.digits ?? 1) : v) + (p.unit || '');
+
+/* Zoom 只放大预览画面，不放大检测输入，因此放大后 ROI 覆盖层与画面对不上：
+   变焦时隐藏方框并禁用框选，回到 1.00x 自动恢复。 */
+function syncZoomUI(){
+  const zoomed = state.zoom > 100;
+  $('#params').querySelectorAll('input[data-needs-zoom]')
+    .forEach(el => { el.disabled = !zoomed; });
+  $('#btn-select').disabled = zoomed;
+  $('#btn-calib').disabled  = zoomed;
+  $('#zoom-tip').hidden = !zoomed;
+  if (zoomed && selecting) { selecting = false; pending = []; refreshSelUI(); }
+  draw();
+}
+
 async function loadParams(){
   const {params} = await api('/api/camera');
   $('#params').innerHTML = params.map(p => `
     <div class="row">
       <label title="${p.name}">${p.name}</label>
-      <input type="range" min="0" max="${p.max}" value="${p.value}" data-name="${p.name}">
-      <span class="val">${p.value}</span>
+      <input type="range" min="${p.min ?? 0}" max="${p.max}" step="${p.step ?? 1}"
+             value="${p.value}" data-name="${p.name}"
+             ${p.needs_zoom ? 'data-needs-zoom="1"' : ''}>
+      <span class="val">${fmtParam(p)(p.value)}</span>
     </div>`).join('');
-  $('#params').querySelectorAll('input[type=range]').forEach(el => {
-    el.addEventListener('input', () => el.nextElementSibling.textContent = el.value);
+  $('#params').querySelectorAll('input[type=range]').forEach((el, i) => {
+    const fmt = fmtParam(params[i]);
+    el.addEventListener('input', () => {
+      el.nextElementSibling.textContent = fmt(+el.value);
+      if (el.dataset.name === 'Zoom') { state.zoom = +el.value; syncZoomUI(); }
+    });
     el.addEventListener('change', async () => {
       try { await api('/api/camera', 'POST', {name: el.dataset.name, value: +el.value}); }
       catch (e) { alert('设置失败: ' + e.message); }
     });
   });
+  state.zoom = (params.find(p => p.name === 'Zoom') || {}).value ?? 100;
+  syncZoomUI();
 }
 
 /* ---------- 轮询状态与事件 ---------- */
