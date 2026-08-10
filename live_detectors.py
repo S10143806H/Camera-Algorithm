@@ -31,6 +31,19 @@ BLACK = "black_screen"
 # 与离线脚本一致：长边压到 960 再判，阈值才和离线验证过的行为相同
 TARGET_W = 960.0
 
+# ---- 黑屏的"还活着"豁免 ----
+# 屏幕整片发黑但角落有个动画图标（开机动画、加载转圈）时，面板其实是好的，
+# 判黑屏属于误报。单看亮区面积不够——桌面反光、背光漏边同样是亮的且面积相近，
+# 所以要求亮区**同时在动**：反光不会动，动画会。
+# 实测同一台架：S1（黑底上有个动的蓝色图标）亮像素占比 0.61%、亮区运动像素
+# 138~253；S3（真黑屏）两项都是 0。
+LIT_T = 80            # 判"亮"的灰度阈值
+LIT_FRAC_MIN = 0.0015 # 亮像素占 ROI 的最小比例
+MOVE_DIFF_T = 25      # 帧间灰度差多大算"动了"
+MOVE_PX_MIN = 40      # 亮区里至少这么多像素在动才算屏幕还活着
+ALIVE_HOLD_S = 2.0    # 动过一次就按"活着"保持这么久：动画有停顿帧，
+                      # 逐帧要求"正在动"会让判定在 ok / BLACK 之间反复跳
+
 
 def _load_detector_classes():
     """按需导入各类型检测器；某个脚本缺失不影响其它类型。"""
@@ -95,6 +108,9 @@ class ScreenDetectors:
         self.scale = scale
         self.types = types
         self.dets = {}
+        self._prev_lit = None            # 上一帧 ROI 灰度，用于判亮区是否在动
+        self._alive_hold = 0             # 亮区动过后的保持帧数
+        self._hold_frames = max(1, int((fps or 25.0) * ALIVE_HOLD_S))
         rs = tuple(int(v * scale) for v in roi) if roi else None
         for t in types:
             if t == BLACK:
@@ -107,6 +123,37 @@ class ScreenDetectors:
             except Exception as e:          # noqa: BLE001
                 print(f"⚠️ 初始化 {t} 检测器失败: {e}")
 
+    def _alive(self, frame):
+        """屏幕是否"还活着"：亮区存在且在动。返回 (是否活着, 说明)。"""
+        if self.roi:
+            x, y, w, h = (int(v) for v in self.roi)
+            sub = frame[y:y+h, x:x+w]
+        else:
+            sub = frame
+        if sub.size == 0:
+            return False, ""
+        g = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
+        lit = g > LIT_T
+        frac = float(lit.mean())
+        prev, self._prev_lit = self._prev_lit, g.copy()
+        if frac < LIT_FRAC_MIN:
+            # 亮区都没有了：立刻作废保持窗口，屏真黑了要马上报
+            self._alive_hold = 0
+            return False, ""
+        if prev is None or prev.shape != g.shape:
+            # 有亮区但没有上一帧可比，判不了动不动；这一帧先不报黑屏。
+            # 真黑屏走不到这里（亮区占比为 0），所以不会拖慢真故障的上报。
+            return True, f"亮区待判 lit={frac*100:.2f}%"
+        d = cv2.absdiff(g, prev)
+        moving = int(((d > MOVE_DIFF_T) & (lit | (prev > LIT_T))).sum())
+        if moving >= MOVE_PX_MIN:
+            self._alive_hold = self._hold_frames
+            return True, f"亮区在动 lit={frac*100:.2f}% mov={moving}"
+        if self._alive_hold > 0:
+            self._alive_hold -= 1
+            return True, f"亮区刚动过 lit={frac*100:.2f}%"
+        return False, ""
+
     def run(self, frame, small, gray, t):
         """返回 {type: {...}}，形状与黑屏结果对齐。"""
         out = {}
@@ -116,11 +163,21 @@ class ScreenDetectors:
             except TypeError:
                 r = detect_dark_region(frame)
             region = r.get("region") or {}
+            abnormal = bool(r.get("abnormal"))
+            info = f"dark={region.get('dark_pct', 0.0):.1f}%"
+            if abnormal:
+                alive, why = self._alive(frame)
+                if alive:
+                    # 面板在出画面，只是内容几乎全黑；判黑屏会误报
+                    abnormal, info = False, f"{info} 但{why}"
+                    r = dict(r); r["abnormal"] = False
+            else:
+                self._alive(frame)        # 保持上一帧缓存连续，避免刚异常时无参考
             out[BLACK] = {
-                "abnormal": bool(r.get("abnormal")),
+                "abnormal": abnormal,
                 "bbox": region.get("bbox"),
                 "score": round(min(1.0, float(region.get("dark_pct", 0.0)) / 100.0), 3),
-                "info": f"dark={region.get('dark_pct', 0.0):.1f}%",
+                "info": info,
                 # 保留原始结构，事件与标注沿用既有黑屏逻辑
                 "raw": r,
             }

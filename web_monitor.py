@@ -450,6 +450,11 @@ class MonitorService:
         with self.lock:
             return self._jpeg
 
+    def snapshot_raw(self):
+        """未标注的原始帧（调阈值用，标注版会被告警蒙版污染）。"""
+        with self.lock:
+            return None if self._raw is None else self._raw.copy()
+
     def calibrate(self):
         """用滚动缓存的最大亮度图自动标定多块屏幕。"""
         if not HAVE_DETECTOR:
@@ -885,8 +890,20 @@ def api_device_context():
 
 
 @app.get("/api/snapshot")
-def api_snapshot():
-    """当前帧单张 JPEG，便于外部脚本抓图或做健康检查。"""
+def api_snapshot(raw: int = 0):
+    """当前帧单张 JPEG，便于外部脚本抓图或做健康检查。
+
+    raw=1 取未标注的原始帧：调阈值时必须用它，标注版的红色告警蒙版会把
+    ROI 内的亮度整体抬高，拿它量出来的阈值是错的。
+    """
+    if raw:
+        frame = service.snapshot_raw()
+        if frame is None:
+            raise HTTPException(503, "尚无画面")
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not ok:
+            raise HTTPException(500, "编码失败")
+        return StreamingResponse(iter([buf.tobytes()]), media_type="image/jpeg")
     jpg = service.snapshot_jpeg()
     if jpg is None:
         raise HTTPException(503, "尚无画面")
