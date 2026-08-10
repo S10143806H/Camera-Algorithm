@@ -361,7 +361,7 @@ python3 web_monitor.py --types all                             # 全开
 | `black_screen` | BLACK | 红 | 默认开启 |
 | `white_screen` | WHITE | 棕 | 屏幕整片发白 |
 | `screen_flicking` | FLICK | 黄 | 亮度反复跳变 |
-| `screen_distorted` | GARBLE | 品红 | 花屏 / 马赛克 / 高频噪点 |
+| `screen_distorted` | GARBLE | 品红 | 花屏 / 马赛克 / 高频噪点 / **大块乱色（含定格不动的）** |
 | `screen_freeze` | FREEZE | 青 | 画面长时间完全静止 |
 
 > **默认只开黑屏是有原因的。** 黑屏 / 花屏 / 闪屏可放心常开（本仓库的
@@ -740,6 +740,7 @@ curl -s localhost:8000/api/notify        # available=true 即配置就绪
 | Wayland 下预览窗口异常 | Qt 后端不匹配 | `export QT_QPA_PLATFORM=xcb` 后重跑 |
 | 网页画面不动、顶部标签变红 | 相机掉线（USB 重新枚举 `/dev/videoN` 换号） | 服务会自动重新枚举并找回（实测约 5 秒），无需干预；顶部标签会显示重连次数 |
 | 重启后突然满屏误报黑屏 | 相机协商到了别的分辨率（实测 1280x720 → 640x480），ROI 整体错位 | 已修：启动固定 `--width/--height`，且 ROI 存盘时记录标定分辨率、载入时按比例换算 |
+| 屏幕肉眼明显花屏但 GARBLE 一直 0.00 | 旧实现只认高频噪点（Sobel 梯度），大块乱色梯度不够；且要求"花纹在动"，定格花屏被整类挡掉；细长 ROI 切不出足够网格 | 已修：新增相邻网格 Lab 色跳判据（不设动态门槛）、网格边长按 ROI 自适应、最小连片格数改为相对比例 |
 | 判定在 BLACK / ok 之间快速闪烁 | 自动曝光在追光，画面亮度反复漂移 | 网页相机参数里把 `AutoExp 0/1` 调 0（手动），再固定 `Exposure`；这是误报第一来源 |
 | 所有 MJPEG 流掉到 ~1fps | 相机掉线后旧版本会空转拖垮进程 | 已修（掉线自愈）；旧版本需手动重启并用正确的 `--device` |
 | 相机 fps 从 ~25 掉到 <1，进程占满一个核 | 设备归因的 logcat 线程在拉全量日志（实测车机约 **2 万行/秒**），逐行跑 Python 正则占满 GIL，饿死采集线程 | 已修：logcat 加 `-T 1`（不回放环形缓冲）+ `-e <正则>`（**设备侧先过滤**）。应急可加 `--no-device-context` 关闭归因验证 |
