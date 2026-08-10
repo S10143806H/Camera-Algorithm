@@ -359,10 +359,18 @@ python3 web_monitor.py --types all                             # 全开
 | 类型 | 代号 | 画面配色 | 说明 |
 |---|---|---|---|
 | `black_screen` | BLACK | 红 | 默认开启 |
-| `white_screen` | WHITE | 棕 | 屏幕整片发白 |
+| `white_screen` | WHITE | 橙 | 屏幕整片发白 |
 | `screen_flicking` | FLICK | 黄 | 亮度反复跳变 |
 | `screen_distorted` | GARBLE | 品红 | 花屏 / 马赛克 / 高频噪点 / **大块乱色（含定格不动的）** |
 | `screen_freeze` | FREEZE | 青 | 画面长时间完全静止 |
+
+**颜色贯穿三处**，看一眼就知道是哪种异常，不用去读文字：
+
+| 位置 | 表现 |
+|---|---|
+| 实时画面 | 屏幕框、异常区框、抬头 `S1:GARBLE` **逐屏按类型上色**（正常屏蓝框、`ok` 绿字） |
+| 屏幕状态表 | 各类型分数 chip，命中的标红 |
+| 飞书卡片 | 每类一套标题与卡片配色：黑屏红、白屏橙、闪屏黄、花屏紫、卡顿蓝，标题带屏号（如 `🌈 花屏 · Screen Distorted · S2/3`） |
 
 > **默认只开黑屏是有原因的。** 黑屏 / 花屏 / 闪屏可放心常开（本仓库的
 > `deploy/screen-monitor.service` 即这三类）；**白屏与冻屏建议按需开**。

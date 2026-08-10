@@ -246,10 +246,31 @@ def send_text(text, dry_run=False):
     return _post({"msg_type": "text", "content": {"text": text}}, dry_run=dry_run)
 
 
+# 每种异常一套标题与卡片配色：群里一眼分得清是黑屏还是花屏，
+# 全都发"Black Screen Detected"的话，多类型同时开就没法从通知里区分
+EVENT_STYLE = {
+    "black_screen":     ("🚨 黑屏 · Black Screen", "red"),
+    "white_screen":     ("⚪ 白屏 · White Screen", "orange"),
+    "screen_flicking":  ("⚡ 闪屏 · Screen Flicking", "yellow"),
+    "screen_distorted": ("🌈 花屏 · Screen Distorted", "purple"),
+    "screen_freeze":    ("🧊 卡顿 · Screen Freeze", "blue"),
+}
+
+
+def _style(event):
+    typ = event.get("event_type") or "black_screen"
+    title, tmpl = EVENT_STYLE.get(typ, (f"🚨 {typ.upper()}", "red"))
+    no = event.get("screen_no")
+    if no:
+        total = event.get("screen_total")
+        title += f" · S{no}" + (f"/{total}" if total else "")
+    return title, tmpl
+
+
 def event_to_text(event):
     """事件 -> 文本消息（卡片被禁用时的降级格式）。"""
     return (
-        "🚨 Display Black Screen Detected\n"
+        f"{_style(event)[0]}\n"
         f"事件：{event.get('event_type', 'black_screen').upper()} ({event.get('event_id', '-')})\n"
         f"来源：{event.get('source', '-')}\n"
         f"视频位置：{_fmt_ts(event.get('source_timestamp_ms'))}\n"
@@ -265,6 +286,9 @@ def event_to_card(event, image_key=None):
     bbox = event.get("bbox")
     fields = [
         ("事件", f"{event.get('event_type', 'black_screen').upper()}  `{event.get('event_id', '-')}`"),
+        ("屏幕", (f"S{event['screen_no']}" + (f" / 共 {event['screen_total']} 块"
+                                              if event.get("screen_total") else ""))
+                 if event.get("screen_no") else "整幅画面"),
         ("来源", str(event.get("source", "-"))),
         ("视频位置", _fmt_ts(event.get("source_timestamp_ms"))),
         ("检测时间", str(event.get("capture_time", "-"))),
@@ -277,14 +301,15 @@ def event_to_card(event, image_key=None):
     elements = [{"tag": "markdown", "content": md}]
     if image_key:
         elements.append({"tag": "img", "img_key": image_key,
-                         "alt": {"tag": "plain_text", "content": "黑屏证据拼图"}})
+                         "alt": {"tag": "plain_text", "content": "异常证据拼图"}})
+    title, template = _style(event)
     return {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "template": "red",
-                "title": {"tag": "plain_text", "content": "🚨 Display Black Screen Detected"},
+                "template": template,
+                "title": {"tag": "plain_text", "content": title},
             },
             "elements": elements + [
                 {"tag": "note", "elements": [{

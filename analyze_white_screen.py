@@ -8,7 +8,7 @@ import anomaly_core as core
 
 
 class WhiteScreenDetector:
-    color = (19, 69, 139)         # 棕 (saddle brown)
+    color = (0, 165, 255)         # 橙：原来的深棕压在亮屏上几乎看不见
     label = "WHITE SCREEN"
     abnormal_type = "white_screen"
     bridge_gap_s = 3.5            # 同区域检出间隙桥接(反光等致中段暂时越界)

@@ -63,6 +63,9 @@ except ImportError:
     HAVE_DETECTOR = False
 
 ROI_STORE = ROOT / "screen_rois.json"
+# 网页上的飞书开关要能扛住重启：systemd 单元里没有 --notify，重启后开关会被
+# 重置成关，等于"开了但下次告警不发"，比一直关着更坑
+STATE_STORE = ROOT / "monitor_state.json"
 EVIDENCE_N = 10
 EVIDENCE_MIN = 3
 EVIDENCE_GAP = 0.4
@@ -102,6 +105,23 @@ def load_rois(frame_size=None):
               for x, y, w, h in rois]
     print(f"🔄 采集分辨率由标定时的 {sw}x{sh} 变为 {cw}x{ch}，ROI 已按比例换算")
     return scaled
+
+
+def load_state():
+    try:
+        return json.loads(STATE_STORE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(**kv):
+    st = load_state()
+    st.update(kv)
+    try:
+        STATE_STORE.write_text(json.dumps(st, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+    except OSError as e:
+        print(f"⚠️ 状态保存失败: {e}")
 
 
 def _clamp_roi(roi, w, h):
@@ -224,6 +244,7 @@ class MonitorService:
         if on and not self._notify_fn:
             raise RuntimeError("飞书告警模块不可用，无法开启")
         self.notify_on = bool(on)
+        save_state(notify_on=self.notify_on)   # 重启后保持，否则等于静默失效
         print(f"📨 飞书告警 -> {'开' if self.notify_on else '关'}")
         return self.notify_on
 
@@ -567,7 +588,10 @@ def enrich_event(ev, screen_no):
                     ds = list(device_screen.displays)
                 if 0 < screen_no <= len(ds):
                     did = ds[screen_no - 1]["display_id"]
-            ev["device_context"] = device_ctx.classify(display_id=did, camera_dark=True)
+            # camera_dark 只对黑屏成立：花屏/闪屏事件里相机看到的是花的不是黑的，
+            # 硬传 True 会让归因输出"设备端正常但相机看到黑"这种不成立的结论
+            ev["device_context"] = device_ctx.classify(
+                display_id=did, camera_dark=(ev.get("event_type") == BLACK))
             ev["device_state"] = device_ctx.status_dict()
         if gtmp:
             ev["gtmp"] = gtmp.snapshot()
@@ -942,7 +966,8 @@ def main():
     except Exception as e:                      # noqa: BLE001
         print(f"⚠️ 飞书告警模块不可用: {e}")
     if notify_cfg and notify_cfg["ready"]:
-        print(f"📨 飞书告警: {'开' if args.notify else '关（网页上可随时打开）'}"
+        on0 = args.notify or load_state().get("notify_on", False)
+        print(f"📨 飞书告警: {'开' if on0 else '关（网页上可随时打开）'}"
               f" · {notify_cfg['mode']} → {notify_cfg['target']}")
     elif notify_cfg:
         print(f"📨 飞书告警: 未配置 — {notify_cfg['problem']}")
@@ -950,7 +975,8 @@ def main():
     service = MonitorService(cap, info, max_screens=args.screens, rois=rois,
                              detect=not args.no_detect, notifier=notifier,
                              jpeg_quality=args.quality, types=args.types,
-                             notify_on=args.notify)
+                             # --notify 强制开；否则沿用网页上次的选择
+                             notify_on=args.notify or load_state().get("notify_on", False))
     print("🔎 启用检测: " + ", ".join(
         f"{TYPE_LABELS.get(t, t)}({t})" for t in service.types))
     service.start()

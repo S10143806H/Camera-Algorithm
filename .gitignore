@@ -9,3 +9,4 @@ data_source/
 processed_videos/
 run.log
 screen_rois.json
+monitor_state.json

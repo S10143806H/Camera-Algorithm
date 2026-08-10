@@ -548,21 +548,42 @@ def _put_text_clamped(img, text, x, y, scale, color, thick=2):
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
-def draw_screen_boxes(img, numbered_rois, active=None, tags=None):
+def _put_text_segments(img, segments, x, y, scale, thick=2, gap=18):
+    """一行里逐段用不同颜色写字。segments: [(文本, BGR), ...]
+
+    抬头 "S1:BLACK  S2:ok  S3:GARBLE" 里每块屏的颜色要跟它的框一致，
+    整行一个颜色就分不出哪块是哪种异常。超宽时换行，避免右侧被截断。
+    """
+    max_x = img.shape[1] - 12
+    line_h = int(cv2.getTextSize("Sg", cv2.FONT_HERSHEY_SIMPLEX, scale, thick)[0][1] * 1.8)
+    cx, cy = int(x), int(y)
+    for text, color in segments:
+        (tw, _th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        if cx > x and cx + tw > max_x:          # 放不下就换行
+            cx, cy = int(x), cy + line_h
+        cv2.putText(img, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thick, cv2.LINE_AA)
+        cx += tw + gap
+
+
+def draw_screen_boxes(img, numbered_rois, active=None, tags=None, colors=None):
     """画每块屏幕的标定框 + 编号。
 
     numbered_rois: [(screen_no, roi), ...] —— 编号由调用方给定，
     不能按列表下标重排，否则单屏事件图会把 S3 画成 S1。
-    active: 异常屏幕编号集合（画红色）。
+    active: 异常屏幕编号集合。
     tags: {屏号: 简写}，异常时附在编号后；缺省不写死"BLACK"，
           否则花屏等其它类型的事件图上会叠出"S1 BLACK"的错误标签。
+    colors: {屏号: BGR}，按命中的异常类型给屏幕框上色；缺省退回红色。
+            一眼要能分清是黑屏还是花屏，全画成红框就得去读文字。
     """
     active = active or set()
     tags = tags or {}
+    colors = colors or {}
     for no, roi in numbered_rois:
         rx, ry, rw, rh = roi
         bad = no in active
-        color = (0, 0, 255) if bad else (255, 160, 0)
+        color = (colors.get(no) or (0, 0, 255)) if bad else (255, 160, 0)
         cv2.rectangle(img, (rx, ry), (rx + rw, ry + rh), color, 3 if bad else 2)
         label = f"S{no}" + (f" {tags.get(no, '')}".rstrip() if bad else "")
         (tw, th_), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
@@ -613,12 +634,13 @@ def annotate_live_multi(frame, results, ts_text, summary=True):
     if overlay is not None:
         annotated = cv2.addWeighted(overlay, 0.22, annotated, 0.78, 0)
 
-    bad, bad_label = set(), {}
+    bad, bad_label, bad_color = set(), {}, {}
     for no, roi, abn, bbox, label, color, short in parsed:
         if not abn:
             continue
         bad.add(no)
         bad_label.setdefault(no, []).append(short)
+        bad_color.setdefault(no, color)     # 一屏多类型时用先命中的那种颜色
         if not bbox:
             continue
         x, y, w_, h_ = bbox
@@ -636,16 +658,18 @@ def annotate_live_multi(frame, results, ts_text, summary=True):
             numbered.append((no, roi))
     if numbered:
         tags = {no: "/".join(dict.fromkeys(v)) for no, v in bad_label.items()}
-        draw_screen_boxes(annotated, numbered, active=bad, tags=tags)
+        draw_screen_boxes(annotated, numbered, active=bad, tags=tags,
+                          colors=bad_color)
     if summary:
         if numbered:
-            text = "  ".join(
-                f"S{no}:{'/'.join(dict.fromkeys(bad_label[no])) if no in bad else 'ok'}"
-                for no, _ in numbered)
+            # 抬头逐屏上色：同一帧上黑屏与花屏并存时，颜色比读文字快
+            segs = [(f"S{no}:{'/'.join(dict.fromkeys(bad_label[no])) if no in bad else 'ok'}",
+                     bad_color.get(no, (0, 180, 0)) if no in bad else (0, 180, 0))
+                    for no, _ in numbered]
+            _put_text_segments(annotated, segs, 12, 34, 0.8)
         else:
-            text = "ABNORMAL" if bad else "normal/dim screen"
-        _put_text_clamped(annotated, text, 12, 34, 0.8,
-                          (0, 0, 255) if bad else (0, 180, 0))
+            _put_text_clamped(annotated, "ABNORMAL" if bad else "normal/dim screen",
+                              12, 34, 0.8, (0, 0, 255) if bad else (0, 180, 0))
     _put_text_clamped(annotated, ts_text, 12, annotated.shape[0] - 40, 0.7, (0, 215, 255))
     return annotated
 
