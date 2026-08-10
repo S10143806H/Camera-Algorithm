@@ -194,6 +194,7 @@ class MonitorService:
         self._raw = None
         self.rois = list(rois or [])
         self.results = []
+        self.multi = []                       # [(屏号, roi, {类型: 结果})]
         self.fps = 0.0
         self.running = True
         self.zoom = 100                       # 预览数字变焦，百分比
@@ -354,6 +355,7 @@ class MonitorService:
                 self._jpeg = buf.tobytes()
                 self._raw = frame
                 self.results = results
+                self.multi = multi         # 逐屏逐类型的原始分数，供状态接口展示
             self.frame_event.set()
             self.frame_event.clear()
 
@@ -503,7 +505,16 @@ class MonitorService:
     def status(self):
         with self.lock:
             results, rois = list(self.results), list(self.rois)
+            multi = list(self.multi)
             n_events = len(self.events)
+        # 每块屏每种类型的实时分数：正常时 _flatten 会把类型丢掉，只剩一个 ok，
+        # 光看状态表分不清"检测器在跑但离阈值还远"和"这个检测器压根没跑"
+        by_screen = {no: {t: {"score": float(r.get("score") or 0.0),
+                              "abnormal": bool(r.get("abnormal")),
+                              "info": r.get("info") or "",
+                              "short": TYPE_SHORT.get(t, t.upper()[:6])}
+                          for t, r in per_type.items()}
+                     for no, _roi, per_type in multi}
         screens = []
         for no, roi, res in results:
             hit = res.get("abnormal") and (res.get("label") or "")
@@ -515,6 +526,7 @@ class MonitorService:
                 "abnormal": bool(res.get("abnormal")),
                 "score": float(res.get("score") or 0.0),
                 "info": res.get("info") or "",
+                "scores": by_screen.get(no, {}),
                 "dark_pct": round(float((res.get("region") or {}).get("dark_pct", 0.0)), 1),
             })
         return {

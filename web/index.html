@@ -70,6 +70,11 @@
       background:#232a36;font-weight:600;font-size:12px}
   .sn.bad{background:var(--bad);color:#fff}
   .sn.ok{background:rgba(46,204,113,.18);color:var(--ok)}
+  /* 各异常类型的实时分数：正常也显示，方便看离阈值还有多远 */
+  .chip{display:inline-block;margin:1px 4px 1px 0;padding:1px 6px;border-radius:5px;
+        background:#232a36;color:var(--dim);font-size:11px;white-space:nowrap;
+        font-variant-numeric:tabular-nums;cursor:help}
+  .chip.bad{background:var(--bad);color:#fff;font-weight:600}
   #events{max-height:340px;overflow:auto}
   #events img{width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--line);
               cursor:zoom-in;transition:border-color .15s}
@@ -391,18 +396,24 @@ async function poll(){
   const byScreen = new Map();
   s.screens.forEach(x => {
     const k = x.no;
-    if (!byScreen.has(k)) byScreen.set(k, {no: x.no, roi: x.roi, hits: []});
+    if (!byScreen.has(k)) byScreen.set(k, {no: x.no, roi: x.roi, hits: [], scores: x.scores});
     if (x.abnormal) byScreen.get(k).hits.push(x);
   });
   const tb = $('#screens').querySelector('tbody');
   tb.innerHTML = byScreen.size
-    ? '<tr><th>屏幕</th><th>状态</th><th>详情</th><th>ROI</th></tr>' + [...byScreen.values()].map(g => {
+    ? '<tr><th>屏幕</th><th>状态</th><th>各类型实时分数</th><th>ROI</th></tr>' + [...byScreen.values()].map(g => {
         const bad = g.hits.length > 0;
         const names = g.hits.map(h => h.label || h.type).join(' + ');
-        const detail = g.hits.map(h => h.info || `score ${h.score}`).join('; ');
+        // 每种类型都列出来，正常时也显示分数——才看得出离阈值还有多远
+        const sc = g.scores || {};
+        const chips = Object.keys(sc).map(t => {
+          const v = sc[t];
+          return `<span class="chip ${v.abnormal ? 'bad' : ''}" title="${t}${v.info ? ' · ' + v.info : ''}"
+                   >${v.short} ${v.score.toFixed(2)}</span>`;
+        }).join('');
         return `<tr><td><span class="sn ${bad ? 'bad' : 'ok'}">S${g.no || '全'}</span></td>
             <td>${bad ? `<b style="color:var(--bad)">${names}</b>` : 'ok'}</td>
-            <td style="color:var(--dim)">${detail || '—'}</td>
+            <td>${chips || '<span style="color:var(--dim)">—</span>'}</td>
             <td style="color:var(--dim)">${g.roi ? g.roi.join(',') : '整幅画面'}</td></tr>`;
       }).join('')
     : '<tr><td class="empty">未标定 ROI，按整幅画面检测</td></tr>';
