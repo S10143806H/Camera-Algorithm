@@ -207,8 +207,12 @@ class DetectorBank:
     def _rebuild(self, rois, shape):
         h, w = shape[:2]
         self.scale = min(1.0, TARGET_W / w)
+        # 未标定 ROI 时整幅画面算一块屏。这里必须给出具体矩形而不是 None：
+        # 各类型检测器在 process() 第一行就把 roi 拆成 sx,sy,sw,sh，拿到 None
+        # 会每帧抛 "cannot unpack non-iterable NoneType"，结果只剩黑屏能跑，
+        # 而黑屏走的是 detect_dark_region 另一条路径，所以现象是"只有黑屏正常"。
         self._screens = [ScreenDetectors(roi, self.scale, self.fps, self.types)
-                         for roi in (rois or [None])]
+                         for roi in (rois or [(0, 0, w, h)])]
         self._key = (tuple(map(tuple, rois or [])), w, h, tuple(self.types))
 
     def run(self, frame, t):

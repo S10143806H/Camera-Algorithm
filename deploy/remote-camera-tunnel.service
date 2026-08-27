@@ -1,0 +1,25 @@
+[Unit]
+Description=SSH tunnel to remote camera MJPEG stream
+After=network-online.target
+
+[Service]
+Type=simple
+# 远端 ustreamer 只绑 127.0.0.1，公网不开任何端口；画面全程走 ssh 加密隧道。
+# 绑 0.0.0.0 而非 127.0.0.1：调试时需要从局域网内的笔记本直接看裸流，
+# 跳过监控实例的解码→检测→重编码链路（实测 +59ms）。
+# 注意这会把台架画面开放给整个局域网；远端 ustreamer 仍只绑 127.0.0.1，公网零暴露。
+# ExitOnForwardFailure=yes 让端口占用时立刻失败并由 Restart 重试，
+# 否则 ssh 会保持连接但不转发，表现为「服务 active 但画面打不开」。
+ExecStart=/usr/bin/ssh -N \
+  -o BatchMode=yes \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=accept-new \
+  -L 0.0.0.0:18080:127.0.0.1:8080 \
+  user@10.79.20.48
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

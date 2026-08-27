@@ -181,6 +181,40 @@ def open_device(idx):
     return None
 
 
+def open_stream(url):
+    """打开网络视频流（MJPEG over HTTP / RTSP），用于远端相机。
+
+    与 open_device 的三点不同：
+      1. 分辨率与帧率由推流端决定，这里 set 无效，只能读回实际值；
+      2. 不做设备名匹配，掉线后按同一个 URL 重连即可；
+      3. 强制 CAP_FFMPEG —— CAP_ANY 在装了 GStreamer 的机器上会优先选它，
+         而 GStreamer 拿到裸 URL 而非 pipeline 时会静默失败，表现为
+         "isOpened() 为真但永远读不到帧"。
+    """
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    # MJPEG over HTTP 的帧会在解码器里排队：缓冲一大就等于看几秒前的画面，
+    # 检测出的异常与飞书告警也跟着延迟。压到 1 帧，宁可丢帧也要实时。
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:  # noqa: BLE001  某些后端不支持该属性，忽略即可
+        pass
+    for _ in range(5):                      # 丢掉握手阶段的残帧
+        cap.read()
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        cap.release()
+        return None
+    # 这里不套用 open_device 的 mean() > 5 亮度校验：远端屏幕本来就可能全黑
+    # （待机/息屏），那正是要检测的异常，不该在打开阶段就判成"打不开"。
+    return cap, {"idx": url, "url": url, "backend": "FFMPEG", "fourcc": "MJPG",
+                 "name": url,
+                 "w": int(cap.get(3)), "h": int(cap.get(4)),
+                 "fps": cap.get(cv2.CAP_PROP_FPS), "mean": float(frame.mean())}
+
+
 def diagnose_all():
     """遍历 index × backend × fourcc × 分辨率组合，找可用画面。"""
     print("=" * 60)

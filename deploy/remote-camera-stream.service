@@ -1,0 +1,36 @@
+[Unit]
+Description=Remote camera MJPEG passthrough (ustreamer)
+After=network-online.target
+
+[Service]
+Type=simple
+User=user
+SupplementaryGroups=video
+# --format=MJPEG 走 UVC 原生流直通，不重新编码；画质与本地采集一致，
+# 上游检测阈值(JUMP_CELL_T/GRAD_T/DYN_T)无需重新标定。
+# 切勿加 --drop-same-frames：那会丢弃重复帧，直接废掉冻屏检测。
+ExecStart=/usr/bin/ustreamer \
+  --device=/dev/video0 \
+  --format=MJPEG \
+  --resolution=1280x720 \
+  --desired-fps=30 \
+  --host=127.0.0.1 \
+  --port=8080 \
+  --persistent \
+  --sharpness=7 \
+  --log-level=1
+# 控制项必须在 ustreamer 打开设备之后再写：内核在设备 open 时会把它们复位成默认。
+#   auto_exposure=3  = 光圈优先（相机自动曝光），与本地相机实例保持一致。
+#   sharpness=7      与曝光无关，实测清晰度 +40%，零代价。
+# 已知代价：自动曝光会被自发光的屏幕带偏。实测开灯时段右屏 67.8% 的像素被推到死白，
+# 花屏检测赖以判定的相邻网格色块跳变在那种状态下物理上不存在，阈值再调也无效。
+# 手动档的参考值为 auto_exposure=1,exposure_time_absolute=90（该模组曝光量化到离散档，
+# 90/100/120 等效），需要时可切回。
+ExecStartPost=/bin/sh -c 'sleep 3; /usr/bin/v4l2-ctl -d /dev/video0 -c auto_exposure=3,sharpness=7'
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

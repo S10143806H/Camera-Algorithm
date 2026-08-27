@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from camera_diag import (  # noqa: E402
+    open_stream,
     CAM_PARAMS,
     annotate_live_multi,
     diagnose_all,
@@ -62,6 +63,7 @@ try:
 except ImportError:
     HAVE_DETECTOR = False
 
+INSTANCE = "local"                     # 实例名，--instance 覆盖
 ROI_STORE = ROOT / "screen_rois.json"
 # 网页上的飞书开关要能扛住重启：systemd 单元里没有 --notify，重启后开关会被
 # 重置成关，等于"开了但下次告警不发"，比一直关着更坑
@@ -71,6 +73,21 @@ EVIDENCE_MIN = 3
 EVIDENCE_GAP = 0.4
 COOLDOWN_S = 10.0
 MAX_EVENTS_KEPT = 200
+
+
+def configure_instance(name):
+    """按实例名重绑持久化文件，让多路相机可以在同一台机器上并存。
+
+    ROI、飞书开关、事件目录原本都是写死的单例文件。第二个实例（远端相机）
+    起来后会把第一个实例标定好的 ROI 直接覆盖掉，两边一起误报。默认实例
+    仍用原文件名，保证现有部署与已标定的 ROI 不受影响。
+    """
+    global INSTANCE, ROI_STORE, STATE_STORE
+    INSTANCE = name or "local"
+    suffix = "" if INSTANCE == "local" else "_" + INSTANCE
+    ROI_STORE = ROOT / ("screen_rois%s.json" % suffix)
+    STATE_STORE = ROOT / ("monitor_state%s.json" % suffix)
+    return INSTANCE
 
 
 # ---------------------------------------------------------------- ROI 持久化
@@ -226,8 +243,11 @@ class MonitorService:
         self._calib_buf = []                  # 滚动标定缓存（每 0.5s 一帧，最多 40）
         self._last_calib_sample = 0.0
         # 事件按 screen_N/<异常类型>/ 分目录，根目录不再写死 black_screen
-        self.event_root = ROOT / "diag_captures" / f"web_{datetime.now().strftime('%Y%m%d')}"
-        self.source_name = f"camera_{info.get('idx', '?')}"
+        self.event_root = (ROOT / "diag_captures"
+                           / f"web_{datetime.now().strftime('%Y%m%d')}_{INSTANCE}")
+        self.source_name = f"{INSTANCE}_camera_{info.get('idx', '?')}"
+        # 网络流源：掉线后不重新枚举 USB，直接按同一个 URL 重连
+        self.stream_url = info.get("url") or None
         # 掉线自愈：USB 重新枚举后 /dev/videoN 会换号，旧 cap 只会一直读失败
         self.cam_name = info.get("name") or ""
         self.cam_status = "采集中"
@@ -274,6 +294,32 @@ class MonitorService:
             self.cap.release()
         except Exception:
             pass
+
+        if self.stream_url:                 # 网络流：URL 不会变，重开即可
+            opened = open_stream(self.stream_url)
+            if not opened:
+                return False
+            cap, info = opened
+            self.cap = cap
+            with self.lock:
+                old = (int(self.info.get("w") or 0), int(self.info.get("h") or 0))
+                new = (int(info.get("w") or 0), int(info.get("h") or 0))
+                self.info = info
+                # 重连时推流端可能还没起稳，OpenCV 会协商到 640x480 之类的其它档位。
+                # ROI 是像素坐标，不跟着换算就会整体越界：检测框跑出画面、
+                # 分区裁剪出空切片(Mean of empty slice)、所有屏立刻误报黑屏。
+                if old != new and all(old) and all(new) and self.rois:
+                    fx, fy = new[0] / old[0], new[1] / old[1]
+                    self.rois = [_clamp_roi((round(x * fx), round(y * fy),
+                                             round(w * fx), round(h * fy)), *new)
+                                 for x, y, w, h in self.rois]
+                    self._screen_state.clear()
+                    print(f"🔄 重连后分辨率 {old[0]}x{old[1]} → {new[0]}x{new[1]}，ROI 已换算")
+                self.cam_online, self.cam_status = True, "采集中"
+                self.reconnects += 1
+            print(f"✅ 视频流已重连: {self.stream_url} "
+                  f"{info.get('w')}x{info.get('h')}（第 {self.reconnects} 次）")
+            return True
 
         cams = list_cameras()
         order = []
@@ -915,6 +961,13 @@ def main():
     global service, device_screen, device_ctx, gtmp
     ap = argparse.ArgumentParser(description="屏幕异常实时监控 Web 服务")
     ap.add_argument("--device", type=int, default=None, help="相机 index，缺省则自动诊断")
+    ap.add_argument("--source",
+                    help="网络视频流地址，替代本地相机。例：远端 ustreamer 经 ssh "
+                         "隧道映射到本机后 http://127.0.0.1:18080/stream。"
+                         "给了 --source 就忽略 --device 与自动诊断")
+    ap.add_argument("--instance", default="local",
+                    help="实例名（默认 local）。多路相机同机并存时用它隔离 ROI、"
+                         "飞书开关与事件目录；默认实例沿用原有文件名")
     ap.add_argument("--screens", type=int, default=3, help="最多识别几块屏幕（默认3）")
     ap.add_argument("--roi", help="启动时固定 ROI: x,y,w,h 多块用分号分隔")
     ap.add_argument("--host", default="0.0.0.0", help="监听地址（默认全网卡）")
@@ -950,15 +1003,23 @@ def main():
     ap.add_argument("--gtmp-bench", type=int, help="关联 GTMP 台架 ID，自动跟踪其运行中的任务")
     args = ap.parse_args()
 
-    opened = open_device(args.device) if args.device is not None else diagnose_all()
+    configure_instance(args.instance)      # 必须早于 load_rois / load_state
+    is_stream = bool(args.source)
+    if is_stream:
+        print(f"🌐 视频流源: {args.source}")
+        opened = open_stream(args.source)
+    elif args.device is not None:
+        opened = open_device(args.device)
+    else:
+        opened = diagnose_all()
     if not opened:
-        print("❌ 打不开相机，Web 服务未启动")
+        print("❌ 打不开%s，Web 服务未启动" % ("视频流" if is_stream else "相机"))
         return 1
     cap, info = opened
 
     # 固定采集分辨率：诊断流程可能协商到 640x480 等其它档位，而 ROI 是像素坐标，
     # 分辨率一变就整体错位并立刻误报黑屏。这里统一钉死，取不到就退回实际值。
-    want_w, want_h = args.width, args.height
+    want_w, want_h = (None, None) if is_stream else (args.width, args.height)
     if want_w and want_h and (int(info.get("w") or 0), int(info.get("h") or 0)) != (want_w, want_h):
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, want_w)
@@ -968,8 +1029,13 @@ def main():
         info["w"], info["h"] = int(cap.get(3)), int(cap.get(4))
         if (info["w"], info["h"]) != (want_w, want_h):
             print(f"⚠️ 相机不支持 {want_w}x{want_h}，实际使用 {info['w']}x{info['h']}")
-    print(f"✅ 相机就绪: idx={info.get('idx')} {info.get('backend')} "
-          f"{info.get('w')}x{info.get('h')}")
+    print(f"✅ {'视频流' if is_stream else '相机'}就绪: idx={info.get('idx')} "
+          f"{info.get('backend')} {info.get('w')}x{info.get('h')}")
+    # 网络流源默认关掉 adb 投屏：DeviceScreenManager 探测的是【本机】USB 上的
+    # 设备，会把本地车机的画面投到远端相机的页面上，看着像串台，极难排查。
+    if is_stream and not args.no_device_screen:
+        args.no_device_screen = True
+        print("ℹ️ 视频流源已自动关闭 adb 投屏（投屏只对本机 USB 设备有意义）")
 
     rois = parse_rois(args.roi) if args.roi else load_rois((info.get("w"), info.get("h")))
     if rois:

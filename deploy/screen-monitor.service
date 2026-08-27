@@ -5,7 +5,14 @@ After=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Camera-Algorithm
+# 飞书凭证等敏感配置放这里，不进 git；文件不存在也不影响启动
+EnvironmentFile=-%h/.config/screen-monitor.env
 ExecStart=%h/Camera-Algorithm/.venv/bin/python3 -u %h/Camera-Algorithm/web_monitor.py --screens 3 --port 8000 --types black_screen,screen_distorted,screen_flicking
+# 相机控制项必须在服务打开设备之后再写：内核在 open 时会把它们复位成默认。
+# auto_exposure=3 光圈优先，sharpness=7 相机侧锐化（实测清晰度 +40%）。
+# 这不是观感问题——像素一旦被钳到 255，花屏检测赖以判定的相邻网格色块跳变
+# 在物理上就不存在了，阈值再调也无效，而且静默失效（不报错，只是再也测不出）。
+ExecStartPost=/bin/sh -c "sleep 5; /usr/bin/v4l2-ctl -d /dev/video0 -c auto_exposure=3,sharpness=7 || true"
 Restart=always
 RestartSec=5
 # 相机被 USB 重新枚举后 index 会变，这里不写死 --device，交给启动时自动诊断

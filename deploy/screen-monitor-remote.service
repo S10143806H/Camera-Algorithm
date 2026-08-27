@@ -1,0 +1,30 @@
+[Unit]
+Description=Screen anomaly monitor - remote camera instance (via ssh tunnel)
+After=remote-camera-tunnel.service
+Requires=remote-camera-tunnel.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/gua/data/apps/Camera-Algorithm
+EnvironmentFile=-%h/.config/screen-monitor.env
+# --instance remote 让这一路用 screen_rois_remote.json / monitor_state_remote.json，
+# 不会覆盖本地相机已标定的 ROI 与飞书开关。
+# --source 指向 ssh 隧道的本地端口；远端 ustreamer 只绑 127.0.0.1，公网零暴露。
+# --quality 95：链路上已经有一代相机原生 MJPEG，这里解码后重编码是第二代压缩。
+# 默认的 75 实测让同区域清晰度从 150.8 掉到 122.6（-19%）。浏览器与本服务同在一台
+# 机器上，这段是本机通信，提高质量不占跨站点链路任何带宽 —— 默认值在这里纯属白扔。
+ExecStart=/home/gua/.virtualenvs/py312/bin/python3 -u \
+  /home/gua/data/apps/Camera-Algorithm/web_monitor.py \
+  --source http://127.0.0.1:18080/stream \
+  --instance remote \
+  --port 8001 \
+  --screens 3 \
+  --types black_screen,screen_distorted,screen_flicking \
+  --quality 95
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
