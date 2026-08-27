@@ -12,7 +12,10 @@ ExecStart=%h/Camera-Algorithm/.venv/bin/python3 -u %h/Camera-Algorithm/web_monit
 # auto_exposure=3 光圈优先，sharpness=7 相机侧锐化（实测清晰度 +40%）。
 # 这不是观感问题——像素一旦被钳到 255，花屏检测赖以判定的相邻网格色块跳变
 # 在物理上就不存在了，阈值再调也无效，而且静默失效（不报错，只是再也测不出）。
-ExecStartPost=/bin/sh -c "sleep 5; /usr/bin/v4l2-ctl -d /dev/video0 -c auto_exposure=3,sharpness=7 || true"
+# 白平衡同样要钉死：自动白平衡会把屏幕内容的蓝通道推爆。实测某台架 S2/S3 灰度
+# 死白 0%（看着完全正常），蓝通道却各有 20% 钳在 255——灰度指标查不出这种丢失。
+# WB 温度单调可调，6500（上限）把蓝通道死白压到 0.0%/1.0%。换台架需重新实测。
+ExecStartPost=/bin/sh -c "sleep 5; /usr/bin/v4l2-ctl -d /dev/video0 -c auto_exposure=3,sharpness=7,white_balance_automatic=0,white_balance_temperature=6500 || true"
 Restart=always
 RestartSec=5
 # 相机被 USB 重新枚举后 index 会变，这里不写死 --device，交给启动时自动诊断
