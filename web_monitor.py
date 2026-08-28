@@ -272,6 +272,9 @@ class MonitorService:
 
     # ---------------------------------------------------------- 生命周期
     def start(self):
+        # 探范围要反复写控制项再还原，画面会短暂抖动；放在采集线程起来之前做，
+        # 免得运行中探测把抖动喂给检测器，误报一串异常
+        self.param_specs()
         self._thread.start()
 
     def stop(self):
