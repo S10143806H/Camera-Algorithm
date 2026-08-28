@@ -183,8 +183,12 @@ def probe_param_range(cap, prop, limit=100000):
 # 花屏检测赖以判定的相邻网格 Lab 色跳算不出来，而且**静默失效**：不报错，只是再
 # 也测不出。灰度指标查不出这种丢失——实测某台架 ROI 灰度死白 0.0% 时蓝通道已有
 # 20% 钳死，所以全程按逐通道统计。
-CALIB_CLIP_MAX = 2.0        # ROI 内任一通道死白(>=250)占比的容忍上限，百分比
-CALIB_MEAN_MIN = 50.0       # ROI 灰度均值下限，再暗对比度不够检测器用
+# 曝光基准取**背景**（画面里扣掉各屏 ROI 的部分）的高光，不取屏幕内容。
+# 屏幕是自发光的、内容一直在变：实测同一台架上增益 0/128/254 三档，各屏死白
+# 占比是 65%/15%/58%——非单调，因为中位数被内容带着走，跟增益没关系。拿它做
+# 二分判据只会收敛到垃圾值。台架机柜与台面是静态漫反射面，才是可复现的基准。
+CALIB_BG_P99 = 235.0        # 背景高光(99 分位)的目标上限，压着 255 留一点余量
+CALIB_CLIP_REPORT = 5.0     # ROI 死白超过这个比例就在日志里点名，仅提示不参与搜索
 CALIB_WB_STEPS = 8          # 白平衡粗扫点数
 # 曝光的搜索区间。不去探真实范围：探一次要 34 次写入，而每次写曝光都会让驱动
 # 重新协商帧时序、阻塞近一秒。超界写入驱动会自己钳回去，二分照样收敛。
@@ -222,6 +226,16 @@ def _grab(cap, settle=CALIB_SETTLE_S, min_flush=CALIB_MIN_FLUSH):
             return None, 0.0
         got = 1
     return frame, got / max(time.time() - t0, 1e-3)
+
+
+def _bg_p99(frame, rois):
+    """背景（扣掉各屏 ROI）灰度的 99 分位。找不到足够背景像素时退回整幅画面。"""
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    m = np.ones(g.shape, dtype=bool)
+    for x, y, w, h in (rois or []):
+        m[int(y):int(y + h), int(x):int(x + w)] = False
+    px = g[m] if m.sum() >= 500 else g.reshape(-1)
+    return float(np.percentile(px, 99))
 
 
 def _roi_stats(frame, rois):
@@ -279,31 +293,27 @@ def calibrate_camera(cap, rois=None, log=print):
     picked = {}
     _grab(cap, CALIB_WARMUP_S)          # 先让开机后的自动曝光收敛
 
-    # --- 亮度：先曝光后增益，都取"不死白前提下的最大值" ---
-    # 死白占比随两者单调递增，可以二分。判据取各屏中位数，容忍一块屏在显示纯白
-    # 页面（那是真内容，压不下去）。
+    # --- 亮度：先曝光后增益，都取"背景高光不过曝前提下的最大值" ---
     def measure(prop, v, min_fps=None):
-        """把候选值写下去，多帧取样后返回 (是否达标, 死白占比, 亮度)。
+        """写入候选值，多帧取样，返回 (是否达标, 背景高光, 实测帧率)。
 
-        必须多帧：屏幕内容一直在变，单帧的死白占比抖得厉害，拿它做二分判据会
-        收敛到错的值——实测出现过二分选定曝光 28、复测却是 60.8% 死白的情况。
+        必须多帧取中位数：单帧受噪声和画面变化影响，拿它做二分判据会收敛到
+        错的值。背景是静态的，两帧就够稳。
         """
         cap.set(prop, v)
-        clips, means, fps_min = [], [], None
+        p99s, fps_min = [], None
         for _ in range(CALIB_SAMPLES):
             frame, fps = _grab(cap)
             if frame is None:
-                return False, 100.0, 0.0
-            st = _roi_stats(frame, rois)
-            clips.append(_typical([c for c, _ in st]))
-            means.append(_typical([m for _, m in st]))
+                return False, 255.0, 0.0
+            p99s.append(_bg_p99(frame, rois))
             fps_min = fps if fps_min is None else min(fps_min, fps)
-        clip = _typical(clips)
-        ok = clip <= CALIB_CLIP_MAX and (min_fps is None or fps_min >= min_fps)
-        return ok, clip, _typical(means)
+        p99 = _typical(p99s)
+        return (p99 <= CALIB_BG_P99 and (min_fps is None or fps_min >= min_fps),
+                p99, fps_min or 0.0)
 
     def search(prop, name, bounds=None, min_fps=None):
-        """二分找满足死白上限的最大值；连最小值都压不住则第二项返回 False。
+        """二分找满足背景高光上限的最大值；连最小值都压不住则第二项返回 False。
 
         bounds 给定时不再探范围：超界的写入会被驱动自己钳回合法区间，取样拿到
         的是钳后的真实画面，二分照样收敛，末尾读回实际值即可。改曝光会让驱动
@@ -314,10 +324,10 @@ def calibrate_camera(cap, rois=None, log=print):
             log(f"   {name}：该后端不可调，跳过")
             return None
         lo, hi = rng
-        good, clip, _ = measure(prop, lo, min_fps)
+        good, p99, _ = measure(prop, lo, min_fps)
         if not good:
             cap.set(prop, lo)
-            log(f"   {name} {lo}（已到最小，死白仍有 {clip:.1f}%）")
+            log(f"   {name} {lo}（已到最小，背景高光仍有 {p99:.0f}）")
             return lo, False
         while hi - lo > 1:
             mid = (lo + hi) // 2
@@ -325,20 +335,18 @@ def calibrate_camera(cap, rois=None, log=print):
                 lo = mid
             else:
                 hi = mid
-        good, clip, mean = measure(prop, lo, min_fps)
+        good, p99, fps = measure(prop, lo, min_fps)
         cap.set(prop, lo)
         actual = int(cap.get(prop))          # 可能被驱动钳过，报实际生效值
-        verdict = "达标" if good else f"复测未达标（上限 {CALIB_CLIP_MAX}%）"
-        log(f"   {name} {actual}（各屏死白中位 {clip:.1f}%，亮度中位 {mean:.0f}，"
-            f"{verdict}）")
+        log(f"   {name} {actual}（背景高光 {p99:.0f}/{CALIB_BG_P99:.0f}"
+            f"{'' if good else '，复测未达标'}，{fps:.0f} fps）")
         return actual, good
 
     # 曝光钉成手动：光圈优先模式会一直追画面亮度，屏幕内容一变就重新漂移——
     # 这既是"判定在 BLACK / ok 之间反复跳"的第一来源，也让标定结果留不住。
-    # 而且实测开灯时段自动曝光会把屏幕推到 90% 以上死白，此时增益到最小也压不住，
-    # 必须靠曝光。曝光量程（1..10000）也比增益（0..255）宽得多，先用它粗调。
+    # 曝光量程（1..10000）比增益（0..255）宽得多，先用它粗调再用增益细调。
     set_auto_exposure(cap, False)
-    # 曝光同时受帧率约束：拉长曝光既会推高死白，也会压低帧率，两者同向，二分
+    # 曝光同时受帧率约束：拉长曝光既会推高亮度，也会压低帧率，两者同向，二分
     # 仍然成立。用帧率而不是写死一个曝光上界，才不依赖具体机型。
     got = search(cv2.CAP_PROP_EXPOSURE, "曝光", bounds=CALIB_EXPOSURE_BOUNDS,
                  min_fps=CALIB_MIN_FPS)
@@ -347,9 +355,6 @@ def calibrate_camera(cap, rois=None, log=print):
     got = search(cv2.CAP_PROP_GAIN, "增益")
     if got:
         picked["gain"] = got[0]
-        if not got[1]:
-            log("   警告：曝光与增益都到最小仍死白，光太强或屏幕亮度调太高，"
-                "花屏检测在死白区域会失效")
 
     # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
     # 必须排在亮度之后：评中性要看背景像素的通道比例，而背景一旦死白，三个通道
@@ -379,10 +384,20 @@ def calibrate_camera(cap, rois=None, log=print):
         cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
         log("   白平衡：该后端不支持手动色温，保持自动")
 
-    # 白平衡改的是各通道增益，可能把某个通道重新推到死白，增益再压一轮
+    # 白平衡改的是各通道增益，会改变整体亮度，增益再压一轮
     got = search(cv2.CAP_PROP_GAIN, "增益复检")
     if got:
         picked["gain"] = got[0]
+
+    # 各屏死白只报告不参与搜索：一块屏正在显示纯白页面时读数本就该接近满值，
+    # 那是真内容不是过曝。但死白区域的色彩信息物理上已经没了，花屏检测在那里
+    # 会静默失效，所以要点名让人知道。
+    frame, _ = _grab(cap)
+    if frame is not None:
+        bad = [f"S{i}={c:.0f}%" for i, (c, _m) in enumerate(_roi_stats(frame, rois), 1)
+               if c > CALIB_CLIP_REPORT]
+        if bad:
+            log(f"   注意：{' '.join(bad)} 有大片死白，若非纯白页面则花屏检测在该屏失效")
 
     # 标定期间反复改控制项，帧率读数会失真；这里实测一段给个可信值
     t0, n = time.time(), 0
