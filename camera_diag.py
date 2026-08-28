@@ -127,6 +127,52 @@ CAM_PARAMS = [
 ]
 
 
+def probe_param_range(cap, prop):
+    """探出驱动实际支持的取值范围，探不出返回 None。
+
+    OpenCV 没有查询控制项范围的接口，而各后端的量纲并不一致：同一个
+    CAP_PROP_BRIGHTNESS，V4L2 上是 -64..64，DSHOW 上是 0..255。写死一个
+    0..255 的后果是滑条上半段**静默失效**——驱动把超界值钳回自己的区间，
+    回读拿到的也是钳过的值，前端照着显示，界面上看不出没生效。
+
+    做法是写一个远超界的值再读回：驱动必然钳到合法边界，读回来就是边界。
+    读不出差异（后端不钳位、只读、或该控制项当前 inactive）就返回 None，
+    由调用方退回写死的量程。
+    """
+    try:
+        orig = cap.get(prop)
+        cap.set(prop, 1e9)
+        hi = cap.get(prop)
+        cap.set(prop, -1e9)
+        lo = cap.get(prop)
+        cap.set(prop, orig)                 # 探测会真的改到相机，必须还原
+        if lo < hi and abs(hi) < 1e6 and abs(lo) < 1e6:
+            return int(lo), int(hi)
+    except Exception:                       # noqa: BLE001  后端不支持该属性
+        pass
+    return None
+
+
+def build_param_specs(cap):
+    """把 CAM_PARAMS 与实际探到的范围合成运行时参数表。
+
+    探到真实范围时用真实范围、且不再做量纲换算（CAM_PARAMS 里的 conv 是为
+    写死量程配的补偿，真范围下反而会错）；探不到就整条退回写死的老行为。
+    """
+    specs = []
+    for name, prop, vmax, conv in CAM_PARAMS:
+        rng = probe_param_range(cap, prop)
+        if rng:
+            lo, hi = rng
+            # "Exposure -n" 的 -n 是写死量程时的取负约定，真范围下不再成立
+            specs.append({"name": name.replace(" -n", ""), "prop": prop,
+                          "min": lo, "max": hi, "conv": None})
+        else:
+            specs.append({"name": name, "prop": prop,
+                          "min": 0, "max": vmax, "conv": conv})
+    return specs
+
+
 def setup_trackbars(win, cap):
     """为相机创建参数滑动条。返回同步函数。"""
     state = {}

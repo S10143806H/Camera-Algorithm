@@ -40,7 +40,7 @@ sys.path.insert(0, str(ROOT))
 
 from camera_diag import (  # noqa: E402
     open_stream,
-    CAM_PARAMS,
+    build_param_specs,
     annotate_live_multi,
     diagnose_all,
     emit_merged_event,
@@ -214,6 +214,8 @@ class MonitorService:
                  notifier=None, jpeg_quality=75, types=None, notify_on=False):
         self.cap = cap
         self.info = info
+        # 相机控制项的真实取值范围要向驱动探，换了设备就得重探（置 None 触发）
+        self._param_specs = None
         self.max_screens = max(1, max_screens)
         self.detect_on = detect and HAVE_DETECTOR
         self.types = normalize_types(types)
@@ -301,6 +303,7 @@ class MonitorService:
                 return False
             cap, info = opened
             self.cap = cap
+            self._param_specs = None
             with self.lock:
                 old = (int(self.info.get("w") or 0), int(self.info.get("h") or 0))
                 new = (int(info.get("w") or 0), int(info.get("h") or 0))
@@ -339,6 +342,7 @@ class MonitorService:
                 continue
             cap, info = opened
             self.cap = cap
+            self._param_specs = None
             with self.lock:
                 old = (int(self.info.get("w") or 0), int(self.info.get("h") or 0))
                 new = (int(info.get("w") or 0), int(info.get("h") or 0))
@@ -537,12 +541,25 @@ class MonitorService:
                 self.results = []
         return self.detect_on
 
+    def param_specs(self):
+        """相机控制项表；首次访问时向驱动探真实范围并缓存。
+
+        探测要写超界值再还原，会瞬时改到相机，所以只在首次访问和换设备后做。
+        """
+        if self._param_specs is None:
+            self._param_specs = build_param_specs(self.cap)
+        return self._param_specs
+
     def camera_params(self):
         out = []
-        for name, prop, vmax, conv in CAM_PARAMS:
-            cur = self.cap.get(prop)
-            val = int(min(max(cur if conv(1) >= 0 else -cur, 0), vmax))
-            out.append({"name": name, "value": val, "max": vmax})
+        for sp in self.param_specs():
+            cur, conv = self.cap.get(sp["prop"]), sp["conv"]
+            if conv is None:
+                val = int(min(max(cur, sp["min"]), sp["max"]))
+            else:
+                val = int(min(max(cur if conv(1) >= 0 else -cur, 0), sp["max"]))
+            out.append({"name": sp["name"], "value": val,
+                        "min": sp["min"], "max": sp["max"]})
         ae = self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
         out.append({"name": "AutoExp 0/1", "value": 0 if ae in (0, 1, 0.25) else 1, "max": 1})
         with self.lock:
@@ -567,10 +584,11 @@ class MonitorService:
                 else:
                     self.pan[0 if name == "Pan X" else 1] = min(max(v, 0), 100)
             return True
-        for pname, prop, vmax, conv in CAM_PARAMS:
-            if pname == name:
-                v = int(min(max(int(value), 0), vmax))
-                self.cap.set(prop, conv(v))
+        for sp in self.param_specs():
+            if sp["name"] == name:
+                conv = sp["conv"]
+                v = int(min(max(int(value), sp["min"]), sp["max"]))
+                self.cap.set(sp["prop"], v if conv is None else conv(v))
                 return True
         return False
 
