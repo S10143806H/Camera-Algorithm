@@ -373,18 +373,25 @@ def calibrate_camera(cap, rois=None, log=print):
     # 只有"曝光被帧率封顶"才轮到增益补光。若曝光是被死白卡住的，加增益只会
     # 同比放大、重新死白，白白引入噪声——实测就出现过增益补到 213、背景高光
     # 上去了但 S3 死白反而涨到 36% 的情况。
+    # 增益补光的门槛定得很高，只保底不调优：噪声是永久代价，背景偏暗却不影响
+    # 检测（检测只看各屏 ROI）。而且台架上屏幕会自己亮灭，每次标定看到的场景
+    # 都不同——补光一旦触发，下次屏幕全亮时就变成过曝加噪点。实测补到 238 时
+    # 画面糊成一片噪声糊，比不补差得多。所以只在"真的很暗"时补，且限幅到量程
+    # 一半，宁可暗一点也不要噪点。
     _, p99, clip, _fps = measure(cv2.CAP_PROP_EXPOSURE, picked.get("exposure", 1))
-    dark = p99 < CALIB_BG_P99 * 0.9
+    dark = p99 < CALIB_BG_P99 * 0.5
     clip_bound = clip > CALIB_FRAME_CLIP_MAX * 0.5
-    if dark and not clip_bound:
-        got = search(cv2.CAP_PROP_GAIN, "增益补光")
+    if dark and not clip_bound and g_rng:
+        half = (g_rng[0] + g_rng[1]) // 2
+        got = search(cv2.CAP_PROP_GAIN, "增益补光", bounds=(g_rng[0], half))
         if got:
             picked["gain"] = got[0]
     elif dark:
         log(f"   增益 {picked.get('gain', '-')}（保持最小：画面偏暗但曝光是被死白"
             f"卡住的，加增益只会同比放大、重新死白）")
     else:
-        log(f"   增益 {picked.get('gain', '-')}（保持最小，曝光已够亮，不引入噪声）")
+        log(f"   增益 {picked.get('gain', '-')}（保持最小，背景高光 {p99:.0f}，"
+            f"够检测用，不引入噪点）")
 
     # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
     # 必须排在亮度之后：评中性要看背景像素的通道比例，而背景一旦死白，三个通道
@@ -414,12 +421,12 @@ def calibrate_camera(cap, rois=None, log=print):
         cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
         log("   白平衡：该后端不支持手动色温，保持自动")
 
-    # 白平衡改的是各通道增益，整体亮度会跟着动；只在偏离目标时才重调，
-    # 且优先动曝光而不是增益，理由同上
+    # 白平衡改的是各通道增益，整体亮度会跟着动；只在超出上限时才重调（偏暗不
+    # 重调，理由同上：宁可暗一点），且动曝光而不是增益
     frame, _ = _grab(cap)
     if frame is not None:
         p99 = _bg_p99(frame, rois)
-        if p99 > CALIB_BG_P99 or p99 < CALIB_BG_P99 * 0.85:
+        if p99 > CALIB_BG_P99:
             got = search(cv2.CAP_PROP_EXPOSURE, "曝光复检",
                          bounds=CALIB_EXPOSURE_BOUNDS, min_fps=CALIB_MIN_FPS)
             if got:
