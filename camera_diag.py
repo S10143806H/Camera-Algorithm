@@ -344,17 +344,31 @@ def calibrate_camera(cap, rois=None, log=print):
 
     # 曝光钉成手动：光圈优先模式会一直追画面亮度，屏幕内容一变就重新漂移——
     # 这既是"判定在 BLACK / ok 之间反复跳"的第一来源，也让标定结果留不住。
-    # 曝光量程（1..10000）比增益（0..255）宽得多，先用它粗调再用增益细调。
     set_auto_exposure(cap, False)
+
+    # 先把增益压到最低，再用曝光去够亮度。同样亮度下噪声只跟增益走：曝光是
+    # 攒更多光子，增益是把已有信号连噪声一起放大。反过来做会选出"极短曝光 +
+    # 最大增益"——实测就落到曝光 20 / 增益 254，画面糊成一片噪点。
+    g_rng = probe_param_range(cap, cv2.CAP_PROP_GAIN)
+    if g_rng:
+        cap.set(cv2.CAP_PROP_GAIN, g_rng[0])
+        picked["gain"] = g_rng[0]
+
     # 曝光同时受帧率约束：拉长曝光既会推高亮度，也会压低帧率，两者同向，二分
     # 仍然成立。用帧率而不是写死一个曝光上界，才不依赖具体机型。
     got = search(cv2.CAP_PROP_EXPOSURE, "曝光", bounds=CALIB_EXPOSURE_BOUNDS,
                  min_fps=CALIB_MIN_FPS)
     if got:
         picked["exposure"] = got[0]
-    got = search(cv2.CAP_PROP_GAIN, "增益")
-    if got:
-        picked["gain"] = got[0]
+
+    # 曝光被帧率封顶后仍然偏暗，才轮到增益补——这是有代价的补法，能不用就不用
+    frame, _ = _grab(cap)
+    if frame is not None and _bg_p99(frame, rois) < CALIB_BG_P99 * 0.9:
+        got = search(cv2.CAP_PROP_GAIN, "增益补光")
+        if got:
+            picked["gain"] = got[0]
+    else:
+        log(f"   增益 {picked.get('gain', '-')}（保持最小，曝光已够亮，不引入噪声）")
 
     # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
     # 必须排在亮度之后：评中性要看背景像素的通道比例，而背景一旦死白，三个通道
@@ -384,10 +398,18 @@ def calibrate_camera(cap, rois=None, log=print):
         cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
         log("   白平衡：该后端不支持手动色温，保持自动")
 
-    # 白平衡改的是各通道增益，会改变整体亮度，增益再压一轮
-    got = search(cv2.CAP_PROP_GAIN, "增益复检")
-    if got:
-        picked["gain"] = got[0]
+    # 白平衡改的是各通道增益，整体亮度会跟着动；只在偏离目标时才重调，
+    # 且优先动曝光而不是增益，理由同上
+    frame, _ = _grab(cap)
+    if frame is not None:
+        p99 = _bg_p99(frame, rois)
+        if p99 > CALIB_BG_P99 or p99 < CALIB_BG_P99 * 0.85:
+            got = search(cv2.CAP_PROP_EXPOSURE, "曝光复检",
+                         bounds=CALIB_EXPOSURE_BOUNDS, min_fps=CALIB_MIN_FPS)
+            if got:
+                picked["exposure"] = got[0]
+        else:
+            log(f"   白平衡后背景高光 {p99:.0f}/{CALIB_BG_P99:.0f}，无需重调")
 
     # 各屏死白只报告不参与搜索：一块屏正在显示纯白页面时读数本就该接近满值，
     # 那是真内容不是过曝。但死白区域的色彩信息物理上已经没了，花屏检测在那里
