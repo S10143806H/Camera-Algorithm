@@ -196,6 +196,8 @@ CALIB_SETTLE_S = 0.6        # 每次改完控制项等画面稳定的时间
 
 
 CALIB_MIN_FLUSH = 10        # 每次取样至少要丢掉的帧数
+CALIB_MAX_WAIT_S = 2.5      # 单次取样的硬上限：长曝光下凑不齐帧数也不能一直等
+CALIB_MIN_FPS = 20.0        # 曝光拉长会压帧率，低于这个值闪屏/冻屏判定就不可靠
 
 
 def _grab(cap, settle=CALIB_SETTLE_S, min_flush=CALIB_MIN_FLUSH):
@@ -206,17 +208,19 @@ def _grab(cap, settle=CALIB_SETTLE_S, min_flush=CALIB_MIN_FLUSH):
     不够就会拿到过渡态的帧——实测按 6 帧丢时整段标定 2 秒跑完，增益那步测到
     98.8% 死白（其实是开机瞬间的过曝帧），直接把结论带偏。
     """
-    end, got = time.time() + settle, 0
+    t0 = time.time()
+    end, hard, got = t0 + settle, t0 + CALIB_MAX_WAIT_S, 0
     frame = None
-    while time.time() < end or got < min_flush:      # 时间与帧数都要满足
+    while (time.time() < end or got < min_flush) and time.time() < hard:
         ok, f = cap.read()
         if ok:
             frame, got = f, got + 1
     if frame is None:
         ok, frame = cap.read()
         if not ok:
-            return None
-    return frame
+            return None, 0.0
+        got = 1
+    return frame, got / max(time.time() - t0, 1e-3)
 
 
 def _roi_stats(frame, rois):
@@ -277,16 +281,17 @@ def calibrate_camera(cap, rois=None, log=print):
     # --- 亮度：先曝光后增益，都取"不死白前提下的最大值" ---
     # 死白占比随两者单调递增，可以二分。判据取各屏中位数，容忍一块屏在显示纯白
     # 页面（那是真内容，压不下去）。
-    def measure(prop, v):
+    def measure(prop, v, min_fps=None):
         cap.set(prop, v)
-        frame = _grab(cap)
+        frame, fps = _grab(cap)
         if frame is None:
             return False, 100.0, 0.0
         st = _roi_stats(frame, rois)
         clip = _typical([c for c, _ in st])
-        return clip <= CALIB_CLIP_MAX, clip, _typical([m for _, m in st])
+        ok = clip <= CALIB_CLIP_MAX and (min_fps is None or fps >= min_fps)
+        return ok, clip, _typical([m for _, m in st])
 
-    def search(prop, name, bounds=None):
+    def search(prop, name, bounds=None, min_fps=None):
         """二分找满足死白上限的最大值；连最小值都压不住则第二项返回 False。
 
         bounds 给定时不再探范围：超界的写入会被驱动自己钳回合法区间，取样拿到
@@ -298,18 +303,18 @@ def calibrate_camera(cap, rois=None, log=print):
             log(f"   {name}：该后端不可调，跳过")
             return None
         lo, hi = rng
-        good, clip, _ = measure(prop, lo)
+        good, clip, _ = measure(prop, lo, min_fps)
         if not good:
             cap.set(prop, lo)
             log(f"   {name} {lo}（已到最小，死白仍有 {clip:.1f}%）")
             return lo, False
         while hi - lo > 1:
             mid = (lo + hi) // 2
-            if measure(prop, mid)[0]:
+            if measure(prop, mid, min_fps)[0]:
                 lo = mid
             else:
                 hi = mid
-        _, clip, mean = measure(prop, lo)
+        _, clip, mean = measure(prop, lo, min_fps)
         cap.set(prop, lo)
         actual = int(cap.get(prop))          # 可能被驱动钳过，报实际生效值
         log(f"   {name} {actual}（各屏死白中位 {clip:.1f}% <= {CALIB_CLIP_MAX}%，"
@@ -321,7 +326,10 @@ def calibrate_camera(cap, rois=None, log=print):
     # 而且实测开灯时段自动曝光会把屏幕推到 90% 以上死白，此时增益到最小也压不住，
     # 必须靠曝光。曝光量程（1..10000）也比增益（0..255）宽得多，先用它粗调。
     set_auto_exposure(cap, False)
-    got = search(cv2.CAP_PROP_EXPOSURE, "曝光", bounds=CALIB_EXPOSURE_BOUNDS)
+    # 曝光同时受帧率约束：拉长曝光既会推高死白，也会压低帧率，两者同向，二分
+    # 仍然成立。用帧率而不是写死一个曝光上界，才不依赖具体机型。
+    got = search(cv2.CAP_PROP_EXPOSURE, "曝光", bounds=CALIB_EXPOSURE_BOUNDS,
+                 min_fps=CALIB_MIN_FPS)
     if got:
         picked["exposure"] = got[0]
     got = search(cv2.CAP_PROP_GAIN, "增益")
@@ -347,7 +355,7 @@ def calibrate_camera(cap, rois=None, log=print):
         for i in range(CALIB_WB_STEPS):
             t = int(lo + (hi - lo) * i / (CALIB_WB_STEPS - 1))
             cap.set(cv2.CAP_PROP_WB_TEMPERATURE, t)
-            frame = _grab(cap)
+            frame, _ = _grab(cap)
             cast = _color_cast(frame, rois) if frame is not None else None
             if cast is not None and (best is None or cast < best[1]):
                 best = (t, cast)
