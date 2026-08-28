@@ -192,7 +192,8 @@ CALIB_EXPOSURE_BOUNDS = (1, 10000)
 
 
 CALIB_WARMUP_S = 2.0        # 开机预热：自动曝光收敛前的帧是过曝的，测了会误判
-CALIB_SETTLE_S = 0.6        # 每次改完控制项等画面稳定的时间
+CALIB_SETTLE_S = 0.45       # 每次改完控制项等画面稳定的时间
+CALIB_SAMPLES = 2           # 每个候选值取几帧再取中位数
 
 
 CALIB_MIN_FLUSH = 10        # 每次取样至少要丢掉的帧数
@@ -282,14 +283,24 @@ def calibrate_camera(cap, rois=None, log=print):
     # 死白占比随两者单调递增，可以二分。判据取各屏中位数，容忍一块屏在显示纯白
     # 页面（那是真内容，压不下去）。
     def measure(prop, v, min_fps=None):
+        """把候选值写下去，多帧取样后返回 (是否达标, 死白占比, 亮度)。
+
+        必须多帧：屏幕内容一直在变，单帧的死白占比抖得厉害，拿它做二分判据会
+        收敛到错的值——实测出现过二分选定曝光 28、复测却是 60.8% 死白的情况。
+        """
         cap.set(prop, v)
-        frame, fps = _grab(cap)
-        if frame is None:
-            return False, 100.0, 0.0
-        st = _roi_stats(frame, rois)
-        clip = _typical([c for c, _ in st])
-        ok = clip <= CALIB_CLIP_MAX and (min_fps is None or fps >= min_fps)
-        return ok, clip, _typical([m for _, m in st])
+        clips, means, fps_min = [], [], None
+        for _ in range(CALIB_SAMPLES):
+            frame, fps = _grab(cap)
+            if frame is None:
+                return False, 100.0, 0.0
+            st = _roi_stats(frame, rois)
+            clips.append(_typical([c for c, _ in st]))
+            means.append(_typical([m for _, m in st]))
+            fps_min = fps if fps_min is None else min(fps_min, fps)
+        clip = _typical(clips)
+        ok = clip <= CALIB_CLIP_MAX and (min_fps is None or fps_min >= min_fps)
+        return ok, clip, _typical(means)
 
     def search(prop, name, bounds=None, min_fps=None):
         """二分找满足死白上限的最大值；连最小值都压不住则第二项返回 False。
@@ -314,12 +325,13 @@ def calibrate_camera(cap, rois=None, log=print):
                 lo = mid
             else:
                 hi = mid
-        _, clip, mean = measure(prop, lo, min_fps)
+        good, clip, mean = measure(prop, lo, min_fps)
         cap.set(prop, lo)
         actual = int(cap.get(prop))          # 可能被驱动钳过，报实际生效值
-        log(f"   {name} {actual}（各屏死白中位 {clip:.1f}% <= {CALIB_CLIP_MAX}%，"
-            f"亮度中位 {mean:.0f}）")
-        return actual, True
+        verdict = "达标" if good else f"复测未达标（上限 {CALIB_CLIP_MAX}%）"
+        log(f"   {name} {actual}（各屏死白中位 {clip:.1f}%，亮度中位 {mean:.0f}，"
+            f"{verdict}）")
+        return actual, good
 
     # 曝光钉成手动：光圈优先模式会一直追画面亮度，屏幕内容一变就重新漂移——
     # 这既是"判定在 BLACK / ok 之间反复跳"的第一来源，也让标定结果留不住。
