@@ -186,13 +186,19 @@ def probe_param_range(cap, prop, limit=100000):
 CALIB_CLIP_MAX = 2.0        # ROI 内任一通道死白(>=250)占比的容忍上限，百分比
 CALIB_MEAN_MIN = 50.0       # ROI 灰度均值下限，再暗对比度不够检测器用
 CALIB_WB_STEPS = 8          # 白平衡粗扫点数
+# 曝光的搜索区间。不去探真实范围：探一次要 34 次写入，而每次写曝光都会让驱动
+# 重新协商帧时序、阻塞近一秒。超界写入驱动会自己钳回去，二分照样收敛。
+CALIB_EXPOSURE_BOUNDS = (1, 10000)
 
 
 CALIB_WARMUP_S = 2.0        # 开机预热：自动曝光收敛前的帧是过曝的，测了会误判
 CALIB_SETTLE_S = 0.6        # 每次改完控制项等画面稳定的时间
 
 
-def _grab(cap, settle=CALIB_SETTLE_S):
+CALIB_MIN_FLUSH = 10        # 每次取样至少要丢掉的帧数
+
+
+def _grab(cap, settle=CALIB_SETTLE_S, min_flush=CALIB_MIN_FLUSH):
     """持续丢帧到画面稳定再取一帧。
 
     按时间丢而不是按帧数：控制项写下去要几帧才反映到画面，而光圈优先模式下
@@ -200,12 +206,12 @@ def _grab(cap, settle=CALIB_SETTLE_S):
     不够就会拿到过渡态的帧——实测按 6 帧丢时整段标定 2 秒跑完，增益那步测到
     98.8% 死白（其实是开机瞬间的过曝帧），直接把结论带偏。
     """
-    end = time.time() + settle
+    end, got = time.time() + settle, 0
     frame = None
-    while time.time() < end:
+    while time.time() < end or got < min_flush:      # 时间与帧数都要满足
         ok, f = cap.read()
         if ok:
-            frame = f
+            frame, got = f, got + 1
     if frame is None:
         ok, frame = cap.read()
         if not ok:
@@ -305,9 +311,14 @@ def calibrate_camera(cap, rois=None, log=print):
         clip = _typical([c for c, _ in st])
         return clip <= CALIB_CLIP_MAX, clip, _typical([m for _, m in st])
 
-    def search(prop, name):
-        """二分找满足死白上限的最大值；连最小值都压不住则第二项返回 False。"""
-        rng = probe_param_range(cap, prop)
+    def search(prop, name, bounds=None):
+        """二分找满足死白上限的最大值；连最小值都压不住则第二项返回 False。
+
+        bounds 给定时不再探范围：超界的写入会被驱动自己钳回合法区间，取样拿到
+        的是钳后的真实画面，二分照样收敛，末尾读回实际值即可。改曝光会让驱动
+        重新协商帧时序，每次写入都要阻塞近一秒，能省一轮探测就省一轮。
+        """
+        rng = bounds or probe_param_range(cap, prop)
         if not rng:
             log(f"   {name}：该后端不可调，跳过")
             return None
@@ -325,16 +336,17 @@ def calibrate_camera(cap, rois=None, log=print):
                 hi = mid
         _, clip, mean = measure(prop, lo)
         cap.set(prop, lo)
-        log(f"   {name} {lo}（各屏死白中位 {clip:.1f}% <= {CALIB_CLIP_MAX}%，"
+        actual = int(cap.get(prop))          # 可能被驱动钳过，报实际生效值
+        log(f"   {name} {actual}（各屏死白中位 {clip:.1f}% <= {CALIB_CLIP_MAX}%，"
             f"亮度中位 {mean:.0f}）")
-        return lo, True
+        return actual, True
 
     # 曝光钉成手动：光圈优先模式会一直追画面亮度，屏幕内容一变就重新漂移——
     # 这既是"判定在 BLACK / ok 之间反复跳"的第一来源，也让标定结果留不住。
     # 而且实测开灯时段自动曝光会把屏幕推到 90% 以上死白，此时增益到最小也压不住，
     # 必须靠曝光。曝光量程（1..10000）也比增益（0..255）宽得多，先用它粗调。
     set_auto_exposure(cap, False)
-    got = search(cv2.CAP_PROP_EXPOSURE, "曝光")
+    got = search(cv2.CAP_PROP_EXPOSURE, "曝光", bounds=CALIB_EXPOSURE_BOUNDS)
     if got:
         picked["exposure"] = got[0]
     got = search(cv2.CAP_PROP_GAIN, "增益")
