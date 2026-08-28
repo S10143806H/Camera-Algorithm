@@ -188,6 +188,10 @@ def probe_param_range(cap, prop, limit=100000):
 # 占比是 65%/15%/58%——非单调，因为中位数被内容带着走，跟增益没关系。拿它做
 # 二分判据只会收敛到垃圾值。台架机柜与台面是静态漫反射面，才是可复现的基准。
 CALIB_BG_P99 = 235.0        # 背景高光(99 分位)的目标上限，压着 255 留一点余量
+# 屏幕比背景亮，只按背景曝光保不住屏幕高光——实测背景 p99 达标时 S3 仍有 25%
+# 死白。再加一条全画幅死白上限：全画幅统计由面积占优的背景主导，不像单屏中位数
+# 那样被内容带着走，同样对曝光单调，可以并进同一次二分。
+CALIB_FRAME_CLIP_MAX = 1.5  # 全画幅死白像素占比上限，百分比
 CALIB_CLIP_REPORT = 5.0     # ROI 死白超过这个比例就在日志里点名，仅提示不参与搜索
 CALIB_WB_STEPS = 8          # 白平衡粗扫点数
 # 曝光的搜索区间。不去探真实范围：探一次要 34 次写入，而每次写曝光都会让驱动
@@ -297,20 +301,24 @@ def calibrate_camera(cap, rois=None, log=print):
     def measure(prop, v, min_fps=None):
         """写入候选值，多帧取样，返回 (是否达标, 背景高光, 实测帧率)。
 
+        达标 = 背景高光不过曝 且 全画幅死白不超标 且 帧率够用。
+
         必须多帧取中位数：单帧受噪声和画面变化影响，拿它做二分判据会收敛到
         错的值。背景是静态的，两帧就够稳。
         """
         cap.set(prop, v)
-        p99s, fps_min = [], None
+        p99s, clips, fps_min = [], [], None
         for _ in range(CALIB_SAMPLES):
             frame, fps = _grab(cap)
             if frame is None:
                 return False, 255.0, 0.0
             p99s.append(_bg_p99(frame, rois))
+            clips.append(float((frame >= 250).mean()) * 100)
             fps_min = fps if fps_min is None else min(fps_min, fps)
-        p99 = _typical(p99s)
-        return (p99 <= CALIB_BG_P99 and (min_fps is None or fps_min >= min_fps),
-                p99, fps_min or 0.0)
+        p99, clip = _typical(p99s), _typical(clips)
+        ok = (p99 <= CALIB_BG_P99 and clip <= CALIB_FRAME_CLIP_MAX
+              and (min_fps is None or fps_min >= min_fps))
+        return ok, p99, fps_min or 0.0
 
     def search(prop, name, bounds=None, min_fps=None):
         """二分找满足背景高光上限的最大值；连最小值都压不住则第二项返回 False。
