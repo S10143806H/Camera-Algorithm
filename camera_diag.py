@@ -188,12 +188,29 @@ CALIB_MEAN_MIN = 50.0       # ROI 灰度均值下限，再暗对比度不够检�
 CALIB_WB_STEPS = 8          # 白平衡粗扫点数
 
 
-def _grab(cap, flush=6):
-    """丢掉几帧再取：控制项写下去要几帧才反映到画面上。"""
-    for _ in range(flush):
-        cap.read()
-    ok, frame = cap.read()
-    return frame if ok else None
+CALIB_WARMUP_S = 2.0        # 开机预热：自动曝光收敛前的帧是过曝的，测了会误判
+CALIB_SETTLE_S = 0.6        # 每次改完控制项等画面稳定的时间
+
+
+def _grab(cap, settle=CALIB_SETTLE_S):
+    """持续丢帧到画面稳定再取一帧。
+
+    按时间丢而不是按帧数：控制项写下去要几帧才反映到画面，而光圈优先模式下
+    相机还会为了维持整体亮度反过来调曝光，这个回路要几百毫秒才收敛。丢得
+    不够就会拿到过渡态的帧——实测按 6 帧丢时整段标定 2 秒跑完，增益那步测到
+    98.8% 死白（其实是开机瞬间的过曝帧），直接把结论带偏。
+    """
+    end = time.time() + settle
+    frame = None
+    while time.time() < end:
+        ok, f = cap.read()
+        if ok:
+            frame = f
+    if frame is None:
+        ok, frame = cap.read()
+        if not ok:
+            return None
+    return frame
 
 
 def _roi_stats(frame, rois):
@@ -229,7 +246,6 @@ def _color_cast(frame, rois):
     让 WB 去追画面内容。台架背景是机柜/台面这类中性面，才是可用的白参照。
     未钳死、也不太暗的像素才计入，两端的像素已经没有色彩信息。
     """
-    import numpy as np
     m = np.ones(frame.shape[:2], dtype=bool)
     for x, y, w, h in (rois or []):
         m[int(y):int(y + h), int(x):int(x + w)] = False
@@ -250,6 +266,7 @@ def calibrate_camera(cap, rois=None, log=print):
     白平衡的评分；反过来白平衡会改亮度，必须先定。顺序反了要来回迭代。
     """
     picked = {}
+    _grab(cap, CALIB_WARMUP_S)          # 先让开机后的自动曝光收敛
 
     # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
     # 不能用"把蓝通道压到不死白"来选 WB：那是拿偏色换死白。实测某模组 WB 拉到
