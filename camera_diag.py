@@ -293,42 +293,63 @@ def calibrate_camera(cap, rois=None, log=print):
         cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
         log("   白平衡：该后端不支持手动色温，保持自动")
 
-    # --- 增益：在不死白的前提下取最大，画面尽量亮 ---
-    # 死白占比随增益单调，可以二分。判据取各屏中位数，容忍一块屏在显示纯白页面。
-    g_rng = probe_param_range(cap, cv2.CAP_PROP_GAIN)
-    if not g_rng:
-        log("   增益：该后端不可调，跳过")
-        return picked
-    lo, hi = g_rng
-
-    def ok_at(g):
-        cap.set(cv2.CAP_PROP_GAIN, g)
+    # --- 亮度：先曝光后增益，都取"不死白前提下的最大值" ---
+    # 死白占比随两者单调递增，可以二分。判据取各屏中位数，容忍一块屏在显示纯白
+    # 页面（那是真内容，压不下去）。
+    def measure(prop, v):
+        cap.set(prop, v)
         frame = _grab(cap)
         if frame is None:
-            return False, 0.0, 0.0
+            return False, 100.0, 0.0
         st = _roi_stats(frame, rois)
         clip = _typical([c for c, _ in st])
-        mean = _typical([m for _, m in st])
-        return clip <= CALIB_CLIP_MAX, clip, mean
+        return clip <= CALIB_CLIP_MAX, clip, _typical([m for _, m in st])
 
-    good, clip_lo, _ = ok_at(lo)
-    if not good:
-        # 最小增益都压不住：说明是曝光太高，增益已经无能为力
-        cap.set(cv2.CAP_PROP_GAIN, lo)
-        picked["gain"] = lo
-        log(f"   增益 {lo}（已到最小，死白仍有 {clip_lo:.1f}%，需要降曝光）")
-        return picked
-    while hi - lo > 1:                      # 找满足死白上限的最大增益
-        mid = (lo + hi) // 2
-        good, _, _ = ok_at(mid)
-        if good:
-            lo = mid
-        else:
-            hi = mid
-    _, clip, mean = ok_at(lo)
-    cap.set(cv2.CAP_PROP_GAIN, lo)
-    picked["gain"] = lo
-    log(f"   增益 {lo}（各屏死白中位 {clip:.1f}% ≤ {CALIB_CLIP_MAX}%，亮度中位 {mean:.0f}）")
+    def search(prop, name):
+        """二分找满足死白上限的最大值；连最小值都压不住则第二项返回 False。"""
+        rng = probe_param_range(cap, prop)
+        if not rng:
+            log(f"   {name}：该后端不可调，跳过")
+            return None
+        lo, hi = rng
+        good, clip, _ = measure(prop, lo)
+        if not good:
+            cap.set(prop, lo)
+            log(f"   {name} {lo}（已到最小，死白仍有 {clip:.1f}%）")
+            return lo, False
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if measure(prop, mid)[0]:
+                lo = mid
+            else:
+                hi = mid
+        _, clip, mean = measure(prop, lo)
+        cap.set(prop, lo)
+        log(f"   {name} {lo}（各屏死白中位 {clip:.1f}% <= {CALIB_CLIP_MAX}%，"
+            f"亮度中位 {mean:.0f}）")
+        return lo, True
+
+    # 曝光钉成手动：光圈优先模式会一直追画面亮度，屏幕内容一变就重新漂移——
+    # 这既是"判定在 BLACK / ok 之间反复跳"的第一来源，也让标定结果留不住。
+    # 而且实测开灯时段自动曝光会把屏幕推到 90% 以上死白，此时增益到最小也压不住，
+    # 必须靠曝光。曝光量程（1..10000）也比增益（0..255）宽得多，先用它粗调。
+    set_auto_exposure(cap, False)
+    got = search(cv2.CAP_PROP_EXPOSURE, "曝光")
+    if got:
+        picked["exposure"] = got[0]
+    got = search(cv2.CAP_PROP_GAIN, "增益")
+    if got:
+        picked["gain"] = got[0]
+        if not got[1]:
+            log("   警告：曝光与增益都到最小仍死白，光太强或屏幕亮度调太高，"
+                "花屏检测在死白区域会失效")
+
+    # 标定期间反复改控制项，帧率读数会失真；这里实测一段给个可信值
+    t0, n = time.time(), 0
+    while time.time() - t0 < 1.0:
+        if cap.read()[0]:
+            n += 1
+    log(f"   标定后帧率约 {n} fps")
     return picked
 
 
