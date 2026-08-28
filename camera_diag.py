@@ -302,6 +302,7 @@ def calibrate_camera(cap, rois=None, log=print):
         """写入候选值，多帧取样，返回 (是否达标, 背景高光, 实测帧率)。
 
         达标 = 背景高光不过曝 且 全画幅死白不超标 且 帧率够用。
+        死白一并返回：调用方要用它判断曝光是被死白卡住还是被帧率卡住。
 
         必须多帧取中位数：单帧受噪声和画面变化影响，拿它做二分判据会收敛到
         错的值。背景是静态的，两帧就够稳。
@@ -311,14 +312,14 @@ def calibrate_camera(cap, rois=None, log=print):
         for _ in range(CALIB_SAMPLES):
             frame, fps = _grab(cap)
             if frame is None:
-                return False, 255.0, 0.0
+                return False, 255.0, 100.0, 0.0
             p99s.append(_bg_p99(frame, rois))
             clips.append(float((frame >= 250).mean()) * 100)
             fps_min = fps if fps_min is None else min(fps_min, fps)
         p99, clip = _typical(p99s), _typical(clips)
         ok = (p99 <= CALIB_BG_P99 and clip <= CALIB_FRAME_CLIP_MAX
               and (min_fps is None or fps_min >= min_fps))
-        return ok, p99, fps_min or 0.0
+        return ok, p99, clip, fps_min or 0.0
 
     def search(prop, name, bounds=None, min_fps=None):
         """二分找满足背景高光上限的最大值；连最小值都压不住则第二项返回 False。
@@ -332,7 +333,7 @@ def calibrate_camera(cap, rois=None, log=print):
             log(f"   {name}：该后端不可调，跳过")
             return None
         lo, hi = rng
-        good, p99, _ = measure(prop, lo, min_fps)
+        good, p99, _clip, _fps = measure(prop, lo, min_fps)
         if not good:
             cap.set(prop, lo)
             log(f"   {name} {lo}（已到最小，背景高光仍有 {p99:.0f}）")
@@ -343,7 +344,7 @@ def calibrate_camera(cap, rois=None, log=print):
                 lo = mid
             else:
                 hi = mid
-        good, p99, fps = measure(prop, lo, min_fps)
+        good, p99, _clip, fps = measure(prop, lo, min_fps)
         cap.set(prop, lo)
         actual = int(cap.get(prop))          # 可能被驱动钳过，报实际生效值
         log(f"   {name} {actual}（背景高光 {p99:.0f}/{CALIB_BG_P99:.0f}"
@@ -369,12 +370,19 @@ def calibrate_camera(cap, rois=None, log=print):
     if got:
         picked["exposure"] = got[0]
 
-    # 曝光被帧率封顶后仍然偏暗，才轮到增益补——这是有代价的补法，能不用就不用
-    frame, _ = _grab(cap)
-    if frame is not None and _bg_p99(frame, rois) < CALIB_BG_P99 * 0.9:
+    # 只有"曝光被帧率封顶"才轮到增益补光。若曝光是被死白卡住的，加增益只会
+    # 同比放大、重新死白，白白引入噪声——实测就出现过增益补到 213、背景高光
+    # 上去了但 S3 死白反而涨到 36% 的情况。
+    _, p99, clip, _fps = measure(cv2.CAP_PROP_EXPOSURE, picked.get("exposure", 1))
+    dark = p99 < CALIB_BG_P99 * 0.9
+    clip_bound = clip > CALIB_FRAME_CLIP_MAX * 0.5
+    if dark and not clip_bound:
         got = search(cv2.CAP_PROP_GAIN, "增益补光")
         if got:
             picked["gain"] = got[0]
+    elif dark:
+        log(f"   增益 {picked.get('gain', '-')}（保持最小：画面偏暗但曝光是被死白"
+            f"卡住的，加增益只会同比放大、重新死白）")
     else:
         log(f"   增益 {picked.get('gain', '-')}（保持最小，曝光已够亮，不引入噪声）")
 
