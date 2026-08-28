@@ -274,31 +274,6 @@ def calibrate_camera(cap, rois=None, log=print):
     picked = {}
     _grab(cap, CALIB_WARMUP_S)          # 先让开机后的自动曝光收敛
 
-    # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
-    # 不能用"把蓝通道压到不死白"来选 WB：那是拿偏色换死白。实测某模组 WB 拉到
-    # 上限确实能把蓝死白从 20% 压到 0，但背景 B/G 掉到 0.838，画面明显偏暖。
-    # 死白该由增益去压（等比缩放，不动色彩），WB 只负责还原正确颜色。
-    # 自动白平衡开着时色温是只读的，必须先关掉才探得到范围
-    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
-    wb_rng = probe_param_range(cap, cv2.CAP_PROP_WB_TEMPERATURE)
-    if wb_rng:
-        lo, hi = wb_rng
-        best = None
-        for i in range(CALIB_WB_STEPS):
-            t = int(lo + (hi - lo) * i / (CALIB_WB_STEPS - 1))
-            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, t)
-            frame = _grab(cap)
-            cast = _color_cast(frame, rois) if frame is not None else None
-            if cast is not None and (best is None or cast < best[1]):
-                best = (t, cast)
-        if best:
-            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, best[0])
-            picked["wb_temperature"] = best[0]
-            log(f"   白平衡 {best[0]}K（背景偏色 {best[1]:.3f}，0 为中性）")
-    if "wb_temperature" not in picked:
-        cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
-        log("   白平衡：该后端不支持手动色温，保持自动")
-
     # --- 亮度：先曝光后增益，都取"不死白前提下的最大值" ---
     # 死白占比随两者单调递增，可以二分。判据取各屏中位数，容忍一块屏在显示纯白
     # 页面（那是真内容，压不下去）。
@@ -355,6 +330,39 @@ def calibrate_camera(cap, rois=None, log=print):
         if not got[1]:
             log("   警告：曝光与增益都到最小仍死白，光太强或屏幕亮度调太高，"
                 "花屏检测在死白区域会失效")
+
+    # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
+    # 必须排在亮度之后：评中性要看背景像素的通道比例，而背景一旦死白，三个通道
+    # 都钳在 255，比例恒等于 1，看着"完美中性"其实是没信息。实测把白平衡放在
+    # 前面时选出 3328K（偏色 0.044），放到曝光定好之后选出 4385K（偏色 0.021）。
+    # 不能用"把蓝通道压到不死白"来选 WB：那是拿偏色换死白。实测某模组 WB 拉到
+    # 上限确实能把蓝死白从 20% 压到 0，但背景 B/G 掉到 0.838，画面明显偏暖。
+    # 死白该由增益去压（等比缩放，不动色彩），WB 只负责还原正确颜色。
+    # 自动白平衡开着时色温是只读的，必须先关掉才探得到范围
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    wb_rng = probe_param_range(cap, cv2.CAP_PROP_WB_TEMPERATURE)
+    if wb_rng:
+        lo, hi = wb_rng
+        best = None
+        for i in range(CALIB_WB_STEPS):
+            t = int(lo + (hi - lo) * i / (CALIB_WB_STEPS - 1))
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, t)
+            frame = _grab(cap)
+            cast = _color_cast(frame, rois) if frame is not None else None
+            if cast is not None and (best is None or cast < best[1]):
+                best = (t, cast)
+        if best:
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, best[0])
+            picked["wb_temperature"] = best[0]
+            log(f"   白平衡 {best[0]}K（背景偏色 {best[1]:.3f}，0 为中性）")
+    if "wb_temperature" not in picked:
+        cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
+        log("   白平衡：该后端不支持手动色温，保持自动")
+
+    # 白平衡改的是各通道增益，可能把某个通道重新推到死白，增益再压一轮
+    got = search(cv2.CAP_PROP_GAIN, "增益复检")
+    if got:
+        picked["gain"] = got[0]
 
     # 标定期间反复改控制项，帧率读数会失真；这里实测一段给个可信值
     t0, n = time.time(), 0
