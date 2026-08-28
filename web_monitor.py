@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT))
 from camera_diag import (  # noqa: E402
     open_stream,
     build_param_specs,
+    probe_param_range,
     annotate_live_multi,
     diagnose_all,
     emit_merged_event,
@@ -544,6 +545,19 @@ class MonitorService:
                 self.results = []
         return self.detect_on
 
+    def _reprobe(self, prop):
+        """重探单个控制项的范围，就地更新缓存。"""
+        for i, sp in enumerate(self.param_specs()):
+            if sp["prop"] != prop:
+                continue
+            rng = probe_param_range(self.cap, prop)
+            if rng:
+                lo, hi = rng
+                self._param_specs[i] = {"name": sp["name"].replace(" -n", ""),
+                                        "prop": prop, "min": lo, "max": hi,
+                                        "conv": None}
+            return
+
     def param_specs(self):
         """相机控制项表；首次访问时向驱动探真实范围并缓存。
 
@@ -578,6 +592,10 @@ class MonitorService:
     def set_camera_param(self, name, value):
         if name == "AutoExp 0/1":
             set_auto_exposure(self.cap, bool(int(value)))
+            # 自动曝光开着时 Exposure 控制项是 inactive，启动时探不到范围，只能
+            # 退回写死量程。关掉自动曝光后它才可写，这里重探一次，否则曝光滑条
+            # 一直是错的量程（V4L2 实际 1..10000，写死量程是 0..13 取负）
+            self._reprobe(cv2.CAP_PROP_EXPOSURE)
             return True
         if name in ("Zoom", "Pan X", "Pan Y"):
             v = int(value)
