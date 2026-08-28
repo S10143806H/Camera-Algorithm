@@ -41,6 +41,7 @@ sys.path.insert(0, str(ROOT))
 from camera_diag import (  # noqa: E402
     open_stream,
     build_param_specs,
+    calibrate_camera,
     probe_param_range,
     annotate_live_multi,
     diagnose_all,
@@ -212,11 +213,13 @@ class MonitorService:
     """唯一的相机持有者：采集 → 逐屏检测 → 标注 → 编码 JPEG 供 HTTP 取用。"""
 
     def __init__(self, cap, info, max_screens=3, rois=None, detect=True,
-                 notifier=None, jpeg_quality=75, types=None, notify_on=False):
+                 notifier=None, jpeg_quality=75, types=None, notify_on=False,
+                 auto_calib=True):
         self.cap = cap
         self.info = info
         # 相机控制项的真实取值范围要向驱动探，换了设备就得重探（置 None 触发）
         self._param_specs = None
+        self.auto_calib = auto_calib
         self.max_screens = max(1, max_screens)
         self.detect_on = detect and HAVE_DETECTOR
         self.types = normalize_types(types)
@@ -273,9 +276,18 @@ class MonitorService:
 
     # ---------------------------------------------------------- 生命周期
     def start(self):
-        # 探范围要反复写控制项再还原，画面会短暂抖动；放在采集线程起来之前做，
-        # 免得运行中探测把抖动喂给检测器，误报一串异常
+        # 探范围与自动标定都要反复写控制项，画面会短暂抖动；放在采集线程起来之前
+        # 做，免得把抖动喂给检测器，误报一串异常
         self.param_specs()
+        if self.auto_calib:
+            print("🎚️ 自动标定相机…")
+            try:
+                picked = calibrate_camera(self.cap, self.rois)
+                self._param_specs = None      # 标定改过控制项，缓存的当前值失效
+                if not picked:
+                    print("   没有可调的控制项，保持相机默认")
+            except Exception as e:            # noqa: BLE001  标定失败不该挡住服务
+                print(f"   ⚠️ 标定失败，保持相机默认: {e}")
         self._thread.start()
 
     def stop(self):
@@ -1014,6 +1026,9 @@ def main():
     ap.add_argument("--no-detect", action="store_true", help="只看画面，不做检测")
     ap.add_argument("--notify", action="store_true", help="事件推送飞书（需 FEISHU_WEBHOOK）")
     ap.add_argument("--quality", type=int, default=75, help="MJPEG 质量 1-100（默认75）")
+    ap.add_argument("--no-camera-calib", action="store_true",
+                    help="不做开机自动标定（白平衡取背景最中性档、增益压到各屏"
+                         "不死白）。标定约需 10~20 秒，期间画面会抖")
     ap.add_argument("--no-device-screen", action="store_true",
                     help="不启用 Android 设备投屏（默认自动探测 adb 设备）")
     ap.add_argument("--adb-serial", help="指定 adb 设备序列号（多台设备时）")
@@ -1098,7 +1113,8 @@ def main():
                              detect=not args.no_detect, notifier=notifier,
                              jpeg_quality=args.quality, types=args.types,
                              # --notify 强制开；否则沿用网页上次的选择
-                             notify_on=args.notify or load_state().get("notify_on", False))
+                             notify_on=args.notify or load_state().get("notify_on", False),
+                             auto_calib=not args.no_camera_calib)
     print("🔎 启用检测: " + ", ".join(
         f"{TYPE_LABELS.get(t, t)}({t})" for t in service.types))
     service.start()

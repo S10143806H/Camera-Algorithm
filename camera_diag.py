@@ -178,6 +178,143 @@ def probe_param_range(cap, prop, limit=100000):
     return None
 
 
+# ---- 开机自动标定 ----
+# 目标是"检测器能用"，不是"好看"。任何通道被钳到 255，该处色彩信息物理上就没了，
+# 花屏检测赖以判定的相邻网格 Lab 色跳算不出来，而且**静默失效**：不报错，只是再
+# 也测不出。灰度指标查不出这种丢失——实测某台架 ROI 灰度死白 0.0% 时蓝通道已有
+# 20% 钳死，所以全程按逐通道统计。
+CALIB_CLIP_MAX = 2.0        # ROI 内任一通道死白(>=250)占比的容忍上限，百分比
+CALIB_MEAN_MIN = 50.0       # ROI 灰度均值下限，再暗对比度不够检测器用
+CALIB_WB_STEPS = 8          # 白平衡粗扫点数
+
+
+def _grab(cap, flush=6):
+    """丢掉几帧再取：控制项写下去要几帧才反映到画面上。"""
+    for _ in range(flush):
+        cap.read()
+    ok, frame = cap.read()
+    return frame if ok else None
+
+
+def _roi_stats(frame, rois):
+    """每块 ROI 的 (任一通道死白占比, 灰度均值)。无 ROI 时整幅画面算一块。"""
+    boxes = rois or []
+    if not boxes:
+        h, w = frame.shape[:2]
+        boxes = [(0, 0, w, h)]
+    out = []
+    for x, y, w, h in boxes:
+        sub = frame[int(y):int(y + h), int(x):int(x + w)]
+        if sub.size == 0:
+            continue
+        clip = max(float((sub[:, :, k] >= 250).mean()) * 100 for k in range(3))
+        out.append((clip, float(sub.mean())))
+    return out
+
+
+def _typical(vals):
+    """取中位数而非极值：三块屏里常有一块正在显示纯白页面（那是真内容，不是
+    过曝，压不下去），也常有一块是真黑屏。用极值会被这两种屏各自带偏。"""
+    if not vals:
+        return 0.0
+    v = sorted(vals)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def _color_cast(frame, rois):
+    """背景（画面里扣掉各屏 ROI 的部分）的偏色程度，0 为中性。
+
+    只拿背景评白平衡：屏幕是自发光的，内容本身就有色彩倾向，把它算进去等于
+    让 WB 去追画面内容。台架背景是机柜/台面这类中性面，才是可用的白参照。
+    未钳死、也不太暗的像素才计入，两端的像素已经没有色彩信息。
+    """
+    import numpy as np
+    m = np.ones(frame.shape[:2], dtype=bool)
+    for x, y, w, h in (rois or []):
+        m[int(y):int(y + h), int(x):int(x + w)] = False
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    m &= (g > 60) & (g < 240)
+    if m.sum() < 500:
+        return None
+    b, gr, r = (float(frame[:, :, k][m].mean()) for k in range(3))
+    if gr <= 1:
+        return None
+    return abs(b / gr - 1) + abs(r / gr - 1)
+
+
+def calibrate_camera(cap, rois=None, log=print):
+    """开机自动标定：先定白平衡，再压增益。返回选中的参数字典。
+
+    分两步而不是联合搜索：增益等比缩放全部通道，不改变通道比例，所以它不影响
+    白平衡的评分；反过来白平衡会改亮度，必须先定。顺序反了要来回迭代。
+    """
+    picked = {}
+
+    # --- 白平衡：关掉自动，扫温度，取背景最中性的一档 ---
+    # 不能用"把蓝通道压到不死白"来选 WB：那是拿偏色换死白。实测某模组 WB 拉到
+    # 上限确实能把蓝死白从 20% 压到 0，但背景 B/G 掉到 0.838，画面明显偏暖。
+    # 死白该由增益去压（等比缩放，不动色彩），WB 只负责还原正确颜色。
+    # 自动白平衡开着时色温是只读的，必须先关掉才探得到范围
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    wb_rng = probe_param_range(cap, cv2.CAP_PROP_WB_TEMPERATURE)
+    if wb_rng:
+        lo, hi = wb_rng
+        best = None
+        for i in range(CALIB_WB_STEPS):
+            t = int(lo + (hi - lo) * i / (CALIB_WB_STEPS - 1))
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, t)
+            frame = _grab(cap)
+            cast = _color_cast(frame, rois) if frame is not None else None
+            if cast is not None and (best is None or cast < best[1]):
+                best = (t, cast)
+        if best:
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, best[0])
+            picked["wb_temperature"] = best[0]
+            log(f"   白平衡 {best[0]}K（背景偏色 {best[1]:.3f}，0 为中性）")
+    if "wb_temperature" not in picked:
+        cap.set(cv2.CAP_PROP_AUTO_WB, 1)          # 探不到就还给自动，别停在半途
+        log("   白平衡：该后端不支持手动色温，保持自动")
+
+    # --- 增益：在不死白的前提下取最大，画面尽量亮 ---
+    # 死白占比随增益单调，可以二分。判据取各屏中位数，容忍一块屏在显示纯白页面。
+    g_rng = probe_param_range(cap, cv2.CAP_PROP_GAIN)
+    if not g_rng:
+        log("   增益：该后端不可调，跳过")
+        return picked
+    lo, hi = g_rng
+
+    def ok_at(g):
+        cap.set(cv2.CAP_PROP_GAIN, g)
+        frame = _grab(cap)
+        if frame is None:
+            return False, 0.0, 0.0
+        st = _roi_stats(frame, rois)
+        clip = _typical([c for c, _ in st])
+        mean = _typical([m for _, m in st])
+        return clip <= CALIB_CLIP_MAX, clip, mean
+
+    good, clip_lo, _ = ok_at(lo)
+    if not good:
+        # 最小增益都压不住：说明是曝光太高，增益已经无能为力
+        cap.set(cv2.CAP_PROP_GAIN, lo)
+        picked["gain"] = lo
+        log(f"   增益 {lo}（已到最小，死白仍有 {clip_lo:.1f}%，需要降曝光）")
+        return picked
+    while hi - lo > 1:                      # 找满足死白上限的最大增益
+        mid = (lo + hi) // 2
+        good, _, _ = ok_at(mid)
+        if good:
+            lo = mid
+        else:
+            hi = mid
+    _, clip, mean = ok_at(lo)
+    cap.set(cv2.CAP_PROP_GAIN, lo)
+    picked["gain"] = lo
+    log(f"   增益 {lo}（各屏死白中位 {clip:.1f}% ≤ {CALIB_CLIP_MAX}%，亮度中位 {mean:.0f}）")
+    return picked
+
+
 def build_param_specs(cap):
     """把 CAM_PARAMS 与实际探到的范围合成运行时参数表。
 
